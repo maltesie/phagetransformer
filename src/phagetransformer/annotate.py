@@ -256,30 +256,56 @@ def combine_weights(weights: dict,
                     aggregator_attention: bool = False) -> np.ndarray:
     """Combine per-patch weight layers into a (n_patches, L', 6) array.
 
-    Starts with the main cross-frame attention (n_patches, L', 6) and
-    optionally multiplies in additional weight layers.
+    Combination strategy:
+    - **Same-type layers are averaged** (consensus): frame attention
+      weights from the main path and the branch are averaged, as are
+      pooling weights from both paths.
+    - **Cross-type layers are multiplied** (joint importance): the
+      frame signal is multiplied by the positional pooling signal and
+      the patch-level aggregator signal.
+    - **Per-patch normalization** to [0, 1] is applied after combining
+      so that overlapping patches contribute equally in squeeze_weights.
 
     Parameters
     ----------
     weights : dict from ``model.annotate()`` for one sequence
-    branch_cross_attention : multiply by branch's cross-frame attention
-    branch_pooling_attention : multiply by branch's query-attention pooling
-    encoder_pooling_attention : multiply by main path's query-attention pooling
-    aggregator_attention : multiply by aggregator's patch-level pooling
+    branch_cross_attention : include branch's cross-frame attention
+    branch_pooling_attention : include branch's position-level pooling
+    encoder_pooling_attention : include main path's position-level pooling
+    aggregator_attention : include aggregator's patch-level pooling
     """
-    w = weights['frame_w'].copy()                          # (n_patches, L', 6)
-
+    # --- Frame attention: average if both paths requested ---
+    frame = weights['frame_w'].copy()                      # (n, L', 6)
     if branch_cross_attention:
-        w *= weights['branch_frame_w']
+        frame = (frame + weights['branch_frame_w']) / 2.0
 
-    if branch_pooling_attention:
-        w *= weights['branch_pool_w'][..., None]           # (n, L') → (n, L', 1)
+    w = frame
 
-    if encoder_pooling_attention:
-        w *= weights['pool_w'][..., None]                  # (n, L') → (n, L', 1)
+    # --- Position pooling: average if both paths requested, then multiply ---
+    use_enc_pool = encoder_pooling_attention
+    use_branch_pool = branch_pooling_attention
+    if use_enc_pool or use_branch_pool:
+        if use_enc_pool and use_branch_pool:
+            pool = (weights['pool_w'] + weights['branch_pool_w']) / 2.0
+        elif use_enc_pool:
+            pool = weights['pool_w']
+        else:
+            pool = weights['branch_pool_w']
+        w = w * pool[..., None]                            # (n, L', 1)
 
+    # --- Per-patch normalization to [0, 1] ---
+    # Applied after within-patch combinations (frame × pool) but before
+    # the aggregator multiplier, so that patches are on comparable scales
+    # for max-merging while preserving the aggregator's patch-importance
+    # signal when requested.
+    for i in range(w.shape[0]):
+        patch_max = w[i].max()
+        if patch_max > 0:
+            w[i] /= patch_max
+
+    # --- Aggregator: multiply across patches ---
     if aggregator_attention:
-        w *= weights['agg_w'][:, None, None]               # (n,) → (n, 1, 1)
+        w = w * weights['agg_w'][:, None, None]            # (n, 1, 1)
 
     return w
 
