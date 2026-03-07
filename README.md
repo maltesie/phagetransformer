@@ -32,10 +32,10 @@ phagetransformer init
 phagetransformer init --model_dir ./models/PT
 
 # Predict hosts for phage genomes
-phagetransformer predict --input phages.fasta --run_dir ~/.local/share/phagetransformer/default
+phagetransformer predict --input phages.fasta --model_dir ~/.local/share/phagetransformer/default
 
 # Annotate genomes with reading-frame attention heatmaps
-phagetransformer annotate --input phage.gb --run_dir ~/.local/share/phagetransformer/default
+phagetransformer annotate --input phage.gb --model_dir ~/.local/share/phagetransformer/default
 
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
@@ -69,20 +69,20 @@ phagetransformer init --force
 | `--model_dir` | ~/.local/share/phagetransformer/default | Directory to store model files |
 | `--force` | off | Re-download even if files already exist |
 
-The downloaded directory can then be passed as `--run_dir` to all other commands.
+The downloaded directory can then be passed as `--model_dir` to all other commands.
 
 ### predict
 
 Predict bacterial hosts from phage genome sequences. Reads FASTA input (plain or gzipped), runs the full model, and outputs a TSV with host predictions and confidence scores.
 
 ```bash
-phagetransformer predict --input phages.fasta --run_dir ./models/PT
+phagetransformer predict --input phages.fasta --model_dir ./models/PT
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--input`, `-i` | *required* | Input FASTA file (plain or .gz) |
-| `--run_dir` | *required* | Model directory containing calibration.json and checkpoints/ |
+| `--model_dir` | *required* | Model directory containing calibration.json and checkpoints/ |
 | `--output`, `-o` | stdout | Output TSV file |
 | `--threshold` | from calibration | Score threshold for reporting predictions |
 | `--fdr` | — | Use FDR-calibrated threshold (e.g. `0.1` for 10% FDR) |
@@ -98,20 +98,20 @@ Visualise per-frame attention weights across a genome as heatmaps, with predicte
 
 ```bash
 # FASTA input — genes predicted automatically with pyrodigal
-phagetransformer annotate --input phages.fasta --run_dir ./models/PT
+phagetransformer annotate --input phages.fasta --model_dir ./models/PT
 
 # GenBank input — CDS annotations extracted from the file
-phagetransformer annotate --input phage.gb --run_dir ./models/PT
+phagetransformer annotate --input phage.gb --model_dir ./models/PT
 
 # External protein annotations
-phagetransformer annotate --input phages.fasta --run_dir ./models/PT \
+phagetransformer annotate --input phages.fasta --model_dir ./models/PT \
     --protein_annotations proteins.tsv
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--input`, `-i` | *required* | Input FASTA or GenBank file |
-| `--run_dir` | *required* | Model directory |
+| `--model_dir` | *required* | Model directory |
 | `--output`, `-o` | frame_attention.png | Output plot filename |
 | `--first_n` | 10 | Number of sequences to annotate |
 | `--protein_annotations` | — | External annotation TSV (columns: gene, start, stop, strand, contig, annot, category) |
@@ -205,7 +205,7 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 
 ## Model directory structure
 
-After training, the model directory (`--run_dir`) contains everything needed for inference:
+After training, the model directory (`--model_dir`) contains everything needed for inference:
 
 ```
 models/PT/

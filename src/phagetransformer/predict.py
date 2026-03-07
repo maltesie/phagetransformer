@@ -3,14 +3,14 @@
 
 Loads a trained model checkpoint + calibration.json, processes FASTA input,
 and outputs per-sequence predictions as TSV.  If hosts.csv is present in the
-run directory, taxonomic lineage columns are appended automatically.
+model directory, taxonomic lineage columns are appended automatically.
 
 Usage:
-    python predict.py --input phages.fasta --run_dir ./models/HierDNA
-    python predict.py --input phages.fna.gz --run_dir ./models/HierDNA \
+    python predict.py --input phages.fasta --model_dir ./models/HierDNA
+    python predict.py --input phages.fna.gz --model_dir ./models/HierDNA \
         --fdr 0.1 --top_k 5
 
-Expected run_dir contents:
+Expected model_dir contents:
     calibration.json   — temperature, thresholds, model config, host list
     checkpoints/       — model checkpoint(s)
     hosts.csv          — (optional) phylum,class,order,family,genus
@@ -113,13 +113,13 @@ def tokenize_patches(patches: List[str], tokenizer: CodonTokenizer) -> tuple:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_and_calibration(run_dir: str, checkpoint: Optional[str],
+def load_model_and_calibration(model_dir: str, checkpoint: Optional[str],
                                 device: torch.device):
     """Load calibration.json, build model, load weights. Returns (model, calib)."""
-    calib_path = os.path.join(run_dir, 'calibration.json')
+    calib_path = os.path.join(model_dir, 'calibration.json')
     if not os.path.exists(calib_path):
         raise FileNotFoundError(
-            f"calibration.json not found in {run_dir}. "
+            f"calibration.json not found in {model_dir}. "
             f"Run train.py --calibrate_only first.")
 
     with open(calib_path) as f:
@@ -134,7 +134,7 @@ def load_model_and_calibration(run_dir: str, checkpoint: Optional[str],
     if checkpoint:
         ckpt_path = checkpoint
     else:
-        ckpt_dir = os.path.join(run_dir, 'checkpoints')
+        ckpt_dir = os.path.join(model_dir, 'checkpoints')
         for name in ['best_aggregator.pt', 'last_aggregator.pt']:
             p = os.path.join(ckpt_dir, name)
             if os.path.exists(p):
@@ -268,8 +268,8 @@ def main():
                         help='Input FASTA file (plain or .gz)')
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Output TSV file (default: stdout)')
-    parser.add_argument('--run_dir', type=str, required=True,
-                        help='Training run directory (contains calibration.json)')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Model directory (contains calibration.json and checkpoints/)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--threshold', type=float, default=None,
@@ -296,7 +296,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available()
                           or args.device == 'cpu' else 'cpu')
     model, calib = load_model_and_calibration(
-        args.run_dir, args.checkpoint, device)
+        args.model_dir, args.checkpoint, device)
 
     hosts = calib['hosts']
     temperature = calib['temperature']
@@ -327,16 +327,16 @@ def main():
     if blocked_classes:
         logger.info(f"  {len(blocked_classes)} blocked classes (low val precision)")
 
-    # ---- taxonomy (hosts.csv in run_dir) ------------------------------------
+    # ---- taxonomy (hosts.csv in model_dir) ------------------------------------
     taxonomy = None
     lineage_ranks = []
-    hosts_csv = os.path.join(args.run_dir, 'hosts.csv')
+    hosts_csv = os.path.join(args.model_dir, 'hosts.csv')
     if os.path.exists(hosts_csv):
         taxonomy, lineage_ranks = load_taxonomy(hosts_csv)
         logger.info(f"Loaded taxonomy for {len(taxonomy)} genera "
                     f"(ranks: {', '.join(lineage_ranks)})")
     else:
-        logger.info(f"No hosts.csv in {args.run_dir} — skipping lineage")
+        logger.info(f"No hosts.csv in {args.model_dir} — skipping lineage")
 
     # ---- read input ------------------------------------------------------
     logger.info(f"Reading {args.input} …")

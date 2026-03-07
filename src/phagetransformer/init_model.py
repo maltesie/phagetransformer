@@ -177,7 +177,7 @@ def main():
     logger.info(f"Model directory: {model_dir}")
     logger.info(f"\nTo run predictions:")
     logger.info(f"  phagetransformer predict --input phages.fasta "
-                f"--run_dir {model_dir}")
+                f"--model_dir {model_dir}")
 
 
 if __name__ == '__main__':

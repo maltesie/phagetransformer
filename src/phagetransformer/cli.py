@@ -3,11 +3,11 @@
 
 Usage:
     phagetransformer init                                      # download model
-    phagetransformer predict   --input phages.fasta --run_dir ./models
+    phagetransformer predict   --input phages.fasta --model_dir ./models
     phagetransformer train     --dataset_dir ./data --host_genome_dir ./genomes
-    phagetransformer annotate  --input phage.gb --run_dir ./models
-    phagetransformer extract   --input bacterium.fasta --run_dir ./models
-    phagetransformer evaluate  --input test.fasta --run_dir ./models
+    phagetransformer annotate  --input phage.gb --model_dir ./models
+    phagetransformer extract   --input bacterium.fasta --model_dir ./models
+    phagetransformer evaluate  --input test.fasta --model_dir ./models
 """
 
 import sys
