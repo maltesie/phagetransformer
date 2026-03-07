@@ -532,7 +532,7 @@ def main():
     # ---- annotate --------------------------------------------------------
     tokenizer = CodonTokenizer()
     n_annot = min(args.first_n, len(records))
-    stride = int(patch_nt_len * 0.5)
+    stride = int(patch_nt_len * (2/3) // 3 * 3)
 
     # Build description of active weight layers
     active_layers = ['cross-frame']
@@ -564,7 +564,7 @@ def main():
     annot_lengths = []
     annot_genes = []
     for rec in records[:n_annot]:
-        seq = rec['seq'][1:]
+        seq = rec['seq']
 
         w = annotate_sequence(
             model, tokenizer, seq, patch_nt_len, stride, device,
