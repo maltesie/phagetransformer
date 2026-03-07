@@ -6,18 +6,18 @@ position pooling × aggregator pooling) from a trained model and plots
 heatmaps with predicted or externally-provided coding regions overlaid.
 
 Usage:
-    python annotate.py --input phages.fasta --run_dir ./models/HierDNA
-    python annotate.py --input phage.gb --run_dir ./models/HierDNA
-    python annotate.py --input phages.fasta --run_dir ./models/HierDNA \
-        --first_n 20 --output importance.png
-    python annotate.py --input phages.fasta --run_dir ./models/HierDNA \
+    python annotate.py --input phages.fasta --model_dir ./models/PT
+    python annotate.py --input phage.gb --model_dir ./models/PT
+    python annotate.py --input phages.fasta --model_dir ./models/PT \
+        --first_n 3 --output importance.png
+    python annotate.py --input phages.fasta --model_dir ./models/PT \
         --protein_annotations proteins.tsv --top_n 5
 
 Supported input formats:
     FASTA  (.fasta, .fa, .fna, .fasta.gz) — CDS predicted via pyrodigal
     GenBank (.gb, .gbk, .genbank, .gbff, + .gz) — CDS extracted from file
 
-Expected run_dir contents:
+Expected model_dir contents:
     calibration.json   — temperature, thresholds, model config, host list
     checkpoints/       — model checkpoint(s)
 """
