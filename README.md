@@ -27,7 +27,7 @@ PhageTransformer uses PyTorch and will automatically use CUDA if available. For 
 phagetransformer init
 
 # Or download to a specific directory
-phagetransformer init --model_dir ./models/HierDNA
+phagetransformer init --model_dir ./models/PT
 
 # Predict hosts for phage genomes
 phagetransformer predict --input phages.fasta --run_dir ~/.local/share/phagetransformer/default
@@ -59,7 +59,7 @@ Download pre-trained model weights and calibration files. Run this once after in
 phagetransformer init
 
 # Download to a custom directory
-phagetransformer init --model_dir ./models/HierDNA
+phagetransformer init --model_dir ./models/PT
 
 # Re-download even if files exist
 phagetransformer init --force
@@ -77,7 +77,7 @@ The downloaded directory can then be passed as `--run_dir` to all other commands
 Predict bacterial hosts from phage genome sequences. Reads FASTA input (plain or gzipped), runs the full model, and outputs a TSV with host predictions and confidence scores.
 
 ```bash
-phagetransformer predict --input phages.fasta --run_dir ./models/HierDNA
+phagetransformer predict --input phages.fasta --run_dir ./models/PT
 ```
 
 | Parameter | Default | Description |
@@ -99,13 +99,13 @@ Visualise per-frame attention weights across a genome as heatmaps, with predicte
 
 ```bash
 # FASTA input — genes predicted automatically with pyrodigal
-phagetransformer annotate --input phages.fasta --run_dir ./models/HierDNA
+phagetransformer annotate --input phages.fasta --run_dir ./models/PT
 
 # GenBank input — CDS annotations extracted from the file
-phagetransformer annotate --input phage.gb --run_dir ./models/HierDNA
+phagetransformer annotate --input phage.gb --run_dir ./models/PT
 
 # External protein annotations
-phagetransformer annotate --input phages.fasta --run_dir ./models/HierDNA \
+phagetransformer annotate --input phages.fasta --run_dir ./models/PT \
     --protein_annotations proteins.tsv
 ```
 
@@ -135,8 +135,8 @@ These flags are combinable — each active layer is multiplied into the base cro
 Scan bacterial genomes for candidate prophage regions using a sliding window approach. Each window is run through the full model, and regions where the model confidently predicts a host are flagged as potential prophages.
 
 ```bash
-phagetransformer extract --input bacterium.fasta --run_dir ./models/HierDNA
-phagetransformer extract --input bacterium.gb --run_dir ./models/HierDNA \
+phagetransformer extract --input bacterium.fasta --run_dir ./models/PT
+phagetransformer extract --input bacterium.gb --run_dir ./models/PT \
     --window_size 120000 --stride 60000 --threshold 0.3
 ```
 
@@ -234,7 +234,7 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 Evaluate a trained model on a test set, producing per-class metrics and diagnostic plots.
 
 ```bash
-phagetransformer evaluate --run_dir ./models/HierDNA
+phagetransformer evaluate --run_dir ./models/PT
 ```
 
 ## Model directory structure
@@ -242,7 +242,7 @@ phagetransformer evaluate --run_dir ./models/HierDNA
 After training, the model directory (`--run_dir`) contains everything needed for inference:
 
 ```
-models/HierDNA/
+models/PT/
 ├── calibration.json       # Temperature, thresholds, model config, host list
 ├── hosts.csv              # Host taxonomy (optional, for lineage output)
 ├── checkpoints/
