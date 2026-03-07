@@ -37,9 +37,6 @@ phagetransformer predict --input phages.fasta --run_dir ~/.local/share/phagetran
 # Annotate genomes with reading-frame attention heatmaps
 phagetransformer annotate --input phage.gb --run_dir ~/.local/share/phagetransformer/default
 
-# Scan a bacterial genome for candidate prophage regions
-phagetransformer extract --input bacterium.fasta --run_dir ~/.local/share/phagetransformer/default
-
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
 ```
@@ -131,31 +128,6 @@ The default plot shows the main cross-frame attention weights. Additional attent
 | `--aggregator_attention` | Include the aggregator's patch-level pooling weights |
 
 These flags are combinable — each active layer is multiplied into the base cross-frame attention, producing increasingly specific importance maps.
-
-### extract
-
-Scan bacterial genomes for candidate prophage regions using a sliding window approach. Each window is run through the full model, and regions where the model confidently predicts a host are flagged as potential prophages.
-
-```bash
-phagetransformer extract --input bacterium.fasta --run_dir ./models/PT
-phagetransformer extract --input bacterium.gb --run_dir ./models/PT \
-    --window_size 120000 --stride 60000 --threshold 0.3
-```
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--input`, `-i` | *required* | Input FASTA or GenBank file |
-| `--run_dir` | *required* | Model directory |
-| `--output`, `-o` | prophage_scan.png | Output plot filename |
-| `--output_tsv` | auto | Output TSV of detected regions |
-| `--window_size` | 100000 | Sliding window size in nucleotides |
-| `--stride` | window_size/2 | Window step size in nucleotides |
-| `--threshold` | 0.5 | Confidence threshold for prophage candidate regions |
-| `--min_region` | 5000 | Minimum region size (nt) to report |
-| `--merge_gap` | 5000 | Merge regions separated by less than this distance |
-| `--first_n` | 1 | Number of sequences to scan |
-
-GenBank input overlays CDS annotations on the scan plot.
 
 ### train
 
