@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
+    "scipy>=1.17",
     "pandas>=1.5",
     "biopython>=1.80",
     "matplotlib>=3.6",
