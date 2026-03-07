@@ -464,8 +464,8 @@ def main():
 
     # ---- data ------------------------------------------------------------
     here = os.path.dirname(os.path.realpath(__file__))
-    ds_path = args.dataset_dir or os.path.join(here, '..', '..', '..', 'datasets', 'PhageTransformer')
-    ts_path = args.testset_dir or os.path.join(here, '..', '..', '..', 'data', 'testsets')
+    ds_path = args.dataset_dir
+    ts_path = args.testset_dir
 
     logger.info("Loading data …")
     train_seqs, train_labels, val_seqs, val_labels, hosts = \
