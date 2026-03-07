@@ -2,8 +2,6 @@
 
 A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences across all six reading frames, using a codon-level tokenizer, per-frame CNNs, cross-frame attention, and a multi-level transformer architecture to produce multi-label host genus predictions.
 
-The model operates at two levels: a **patch encoder** processes fixed-length DNA windows (~3 kb) into embeddings, and a **sequence aggregator** combines patch embeddings across the full genome to make sequence-level predictions. A parallel **frame-statistics branch** inside the encoder captures coding-structure signals that distinguish phage from bacterial DNA.
-
 ## Installation
 
 Requires Python ≥ 3.10 and PyTorch ≥ 2.0.
