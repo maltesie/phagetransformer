@@ -103,12 +103,15 @@ class BacterialGenomeStore:
                 f"No host_genome_manifest.tsv in {host_genome_dir}. "
                 f"Run the download script first.")
 
-        # Parse manifest
+        # Parse manifest — genome_path is resolved relative to host_genome_dir
         entries = []  # [(species, path), ...]
         with open(manifest) as f:
             reader = csv.DictReader(f, delimiter='\t')
             for row in reader:
-                entries.append((row['species'], row['genome_path']))
+                genome_path = row['genome_path']
+                if not os.path.isabs(genome_path):
+                    genome_path = os.path.join(host_genome_dir, genome_path)
+                entries.append((row['species'], genome_path))
 
         # Optionally keep only one species per genus
         if one_per_genus:
