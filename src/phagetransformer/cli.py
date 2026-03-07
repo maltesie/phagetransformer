@@ -19,8 +19,6 @@ def main():
         'predict':  ('phagetransformer.predict',    'Predict phage hosts'),
         'train':    ('phagetransformer.train',      'Train a new model'),
         'annotate': ('phagetransformer.annotate',   'Annotate genomes with attention weights'),
-        'extract':  ('phagetransformer.extract',    'Scan bacterial genomes for prophage regions'),
-        'evaluate': ('phagetransformer.evaluate',   'Evaluate model performance'),
     }
 
     if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
