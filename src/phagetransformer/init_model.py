@@ -38,12 +38,6 @@ MODEL_FILES = [
         'sha256': None,
         'size_mb': 0.01,
     },
-    {
-        'filename': 'hosts.csv',
-        'url': 'https://github.com/yourname/phagetransformer/releases/download/v0.1.0/hosts.csv',
-        'sha256': None,
-        'size_mb': 0.01,
-    },
 ]
 
 
