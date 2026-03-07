@@ -2,18 +2,16 @@
 """Inference script for the hierarchical DNA classifier.
 
 Loads a trained model checkpoint + calibration.json, processes FASTA input,
-and outputs per-sequence predictions as TSV.  If hosts.csv is present in the
-model directory, taxonomic lineage columns are appended automatically.
+and outputs per-sequence predictions as TSV.
 
 Usage:
-    python predict.py --input phages.fasta --model_dir ./models/HierDNA
-    python predict.py --input phages.fna.gz --model_dir ./models/HierDNA \
+    python predict.py --input phages.fasta --model_dir ./models/PT
+    python predict.py --input phages.fna.gz --model_dir ./models/PT \
         --fdr 0.1 --top_k 5
 
 Expected model_dir contents:
     calibration.json   — temperature, thresholds, model config, host list
     checkpoints/       — model checkpoint(s)
-    hosts.csv          — (optional) phylum,class,order,family,genus
 """
 
 import argparse
