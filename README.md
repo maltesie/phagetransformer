@@ -205,12 +205,11 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 
 ## Model directory structure
 
-After training, the model directory (`--model_dir`) contains everything needed for inference:
+After training, the model directory (`--run_dir`) contains everything needed for inference:
 
 ```
 models/PT/
 ├── calibration.json       # Temperature, thresholds, model config, host list
-├── hosts.csv              # Host taxonomy (optional, for lineage output)
 ├── checkpoints/
 │   ├── best_encoder.pt
 │   ├── best_aggregator.pt
