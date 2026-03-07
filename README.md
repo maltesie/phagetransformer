@@ -203,14 +203,6 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 | `--merge_val` | Merge train+val for final production run (skips eval and calibration) |
 | `--calibrate_only` | Skip training, just run temperature calibration on validation set |
 
-### evaluate
-
-Evaluate a trained model on a test set, producing per-class metrics and diagnostic plots.
-
-```bash
-phagetransformer evaluate --run_dir ./models/PT
-```
-
 ## Model directory structure
 
 After training, the model directory (`--run_dir`) contains everything needed for inference:
