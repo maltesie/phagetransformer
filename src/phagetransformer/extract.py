@@ -9,8 +9,6 @@ Usage:
     python extract.py --input bacterium.fasta --run_dir ./models/PT
     python extract.py --input bacterium.gb --run_dir ./models/PT \
         --window_size 40000 --stride 30000 --threshold 0.5
-    python extract.py --input bacterium.fasta --run_dir ./models/PT \
-        --output scan.png --importance
 
 Supported input formats:
     FASTA  (.fasta, .fa, .fna, + .gz)
