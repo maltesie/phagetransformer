@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""
+"""Prophage region detection in bacterial genomes.
 
 Scans a bacterial genome with a sliding window, runs the phage host-
-prediction model on each window, and plots prediction class and confidence
-along the genome.
+prediction model on each window, and plots prediction confidence and
+importance along the genome.  Windows where the model confidently
+predicts a host are candidate prophage regions.
 
 Usage:
-    python extract.py --input bacterium.fasta --run_dir ./models/PT
-    python extract.py --input bacterium.gb --run_dir ./models/PT \
-        --window_size 40000 --stride 30000 --threshold 0.5
+    python extract.py --input bacterium.fasta --model_dir ./models/HierDNA
+    python extract.py --input bacterium.gb --model_dir ./models/HierDNA \
+        --window_size 120000 --stride 60000 --threshold 0.5
+    python extract.py --input bacterium.fasta --model_dir ./models/HierDNA \
+        --output prophage_scan.png --importance
 
 Supported input formats:
     FASTA  (.fasta, .fa, .fna, + .gz)
@@ -51,7 +54,6 @@ def read_genbank(path: str) -> list:
     with opener(path, 'rt') as fh:
         for rec in SeqIO.parse(fh, 'genbank'):
             seq = str(rec.seq).upper()
-            seq_len = len(seq)
             genes = []
             for feat in rec.features:
                 if feat.type != 'CDS':
@@ -62,13 +64,9 @@ def read_genbank(path: str) -> list:
                 annot = feat.qualifiers.get('product', [''])[0]
                 gene_name = feat.qualifiers.get('gene', [''])[0]
                 category = annot if annot else gene_name
-                if strand == 1:
-                    frame_idx = (begin - 1) % 3
-                else:
-                    frame_idx = 3 + (seq_len - end) % 3
                 genes.append({
                     'begin': begin, 'end': end,
-                    'strand': strand, 'frame_idx': frame_idx,
+                    'strand': strand,
                     'annot': annot, 'category': category,
                 })
             records.append({'id': rec.id if rec.id != '.' else rec.name,
@@ -91,7 +89,7 @@ def predict_window(model, tokenizer, seq: str, patch_nt_len: int,
     probs : (num_classes,) sigmoid probabilities (multi-label)
     """
     stride = int(patch_nt_len / 3) * 3
-    patches = tile_sequence(seq, patch_nt_len, stride, max_patches)
+    patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
     tokens, counts = tokenize_patches(patches, tokenizer)
     tokens = tokens.to(device, non_blocking=True)
     counts = counts.to(device, non_blocking=True)
@@ -341,7 +339,7 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
 
     # Title
     n_above = sum(1 for c in max_conf if c >= threshold)
-    title = (f'Scan: {seq_id}  ({seq_len:,} nt) — '
+    title = (f'Prophage scan: {seq_id}  ({seq_len:,} nt) — '
              f'{n_above}/{n_windows} windows above threshold')
     ax.set_title(title, fontsize=11, fontweight='bold')
 
@@ -415,16 +413,17 @@ def write_regions_tsv(regions: list, seq_id: str, out_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Scan bacterial genomes for viral regions and annotate the corresponding host.',
+        description='Scan bacterial genomes for candidate prophage regions '
+                    'using the phage host-prediction model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--input', '-i', type=str, required=True,
                         help='Input FASTA or GenBank file')
-    parser.add_argument('--run_dir', type=str, required=True,
-                        help='Training run directory (contains calibration.json)')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Model directory (contains calibration.json and checkpoints/)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
-    parser.add_argument('--output', '-o', type=str, default='scan.png',
+    parser.add_argument('--output', '-o', type=str, default='prophage_scan.png',
                         help='Output plot filename')
     parser.add_argument('--output_tsv', type=str, default=None,
                         help='Output TSV of detected regions '
@@ -434,7 +433,7 @@ def main():
     parser.add_argument('--stride', type=int, default=None,
                         help='Window stride in nt (default: window_size // 2)')
     parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Confidence threshold')
+                        help='Confidence threshold for prophage candidate regions')
     parser.add_argument('--min_region', type=int, default=5000,
                         help='Minimum region size in nt to report')
     parser.add_argument('--merge_gap', type=int, default=5000,
@@ -460,7 +459,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available()
                           or args.device == 'cpu' else 'cpu')
     model, calib = load_model_and_calibration(
-        args.run_dir, args.checkpoint, device)
+        args.model_dir, args.checkpoint, device)
 
     patch_nt_len = calib['model_config']['patch_nt_len']
     host_list = [h.split(';')[-1] for h in calib.get('host_list', calib.get('hosts', []))]
@@ -516,7 +515,7 @@ def main():
             min_region_nt=args.min_region, merge_gap_nt=args.merge_gap,
         )
 
-        logger.info(f"  {len(regions)} host-assigned region(s) "
+        logger.info(f"  {len(regions)} candidate prophage region(s) "
                     f"above {args.threshold:.2f} threshold")
         for reg in regions:
             logger.info(f"    {reg['start']+1:>10,}–{reg['end']:>10,}  "

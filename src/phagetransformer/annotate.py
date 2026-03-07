@@ -6,11 +6,11 @@ position pooling × aggregator pooling) from a trained model and plots
 heatmaps with predicted or externally-provided coding regions overlaid.
 
 Usage:
-    python annotate.py --input phages.fasta --model_dir ./models/PT
-    python annotate.py --input phage.gb --model_dir ./models/PT
-    python annotate.py --input phages.fasta --model_dir ./models/PT \
-        --first_n 3 --output importance.png
-    python annotate.py --input phages.fasta --model_dir ./models/PT \
+    python annotate.py --input phages.fasta --model_dir ./models/HierDNA
+    python annotate.py --input phage.gb --model_dir ./models/HierDNA
+    python annotate.py --input phages.fasta --model_dir ./models/HierDNA \
+        --first_n 20 --output importance.png
+    python annotate.py --input phages.fasta --model_dir ./models/HierDNA \
         --protein_annotations proteins.tsv --top_n 5
 
 Supported input formats:
@@ -60,25 +60,18 @@ def predict_genes(seq: str) -> list:
     Returns list of dicts with keys:
         begin, end  : 1-based genomic coordinates
         strand      : +1 or -1
-        frame_idx   : 0–5 matching the model's frame convention
-                      (0=+1, 1=+2, 2=+3, 3=-1, 4=-2, 5=-3)
+    Frame indices are assigned separately via ``assign_frame_indices``.
     """
     import pyrodigal
     finder = pyrodigal.GeneFinder(meta=True)
     genes_obj = finder.find_genes(seq.encode())
-    seq_len = len(seq)
 
     genes = []
     for g in genes_obj:
-        if g.strand == 1:
-            frame_idx = (g.begin - 1) % 3       # 0, 1, 2
-        else:
-            frame_idx = 3 + (seq_len - g.end) % 3   # 3, 4, 5
         genes.append({
             'begin': g.begin,
             'end': g.end,
             'strand': g.strand,
-            'frame_idx': frame_idx,
         })
     return genes
 
@@ -100,7 +93,6 @@ def read_genbank(path: str) -> List[dict]:
     with opener(path, 'rt') as fh:
         for rec in SeqIO.parse(fh, 'genbank'):
             seq = str(rec.seq).upper()
-            seq_len = len(seq)
             genes = []
 
             for feat in rec.features:
@@ -116,17 +108,11 @@ def read_genbank(path: str) -> List[dict]:
                 gene_name = feat.qualifiers.get('gene', [''])[0]
                 category = annot if annot else gene_name
 
-                if strand == 1:
-                    frame_idx = (begin - 1) % 3
-                else:
-                    frame_idx = 3 + (seq_len - end) % 3
-
                 genes.append({
                     'begin': begin,
                     'end': end,
                     'strand': strand,
                     'strand_str': '+' if strand == 1 else '-',
-                    'frame_idx': frame_idx,
                     'annot': annot,
                     'category': category,
                 })
@@ -180,7 +166,16 @@ def load_protein_annotations(path: str) -> Dict[str, list]:
 
 
 def assign_frame_indices(genes: list, seq_len: int) -> list:
-    """Assign frame_idx (0–5) to gene dicts based on coordinates and seq length."""
+    """Assign biological frame_idx (0–5) to gene dicts.
+
+    This is the single source of truth for frame assignment.  All
+    annotation sources (pyrodigal, GenBank, external TSV) should pass
+    through this function.
+
+    Convention (1-based coordinates):
+        Forward strand: frame_idx = (begin - 1) % 3       → 0, 1, 2
+        Reverse strand: frame_idx = 3 + (seq_len - end) % 3  → 3, 4, 5
+    """
     for g in genes:
         if g['strand'] == 1:
             g['frame_idx'] = (g['begin'] - 1) % 3
@@ -189,19 +184,64 @@ def assign_frame_indices(genes: list, seq_len: int) -> list:
     return genes
 
 
-def squeeze_weights(w, patch_nt_len:int, stride: int, seq_len: int, compression_factor: int):
+def _frame_permutation(start_nt: int, patch_nt_len: int,
+                       seq_len: int) -> list:
+    """Compute column permutation mapping model frames → biological frames.
+
+    Returns a list of 6 indices such that
+    ``w_biological = w_model[:, perm]`` aligns model frame channels
+    with the genome's biological reading frames.
+
+    Forward model frame f (0–2) reads codons from genomic position
+    ``start_nt + f``, so it corresponds to biological frame
+    ``(start_nt + f) % 3``.
+
+    Reverse model frame 3+o reads the reverse complement starting at
+    offset o from the 3' end of the patch.  The first codon's genomic
+    'end' coordinate (1-based) is ``start_nt + patch_nt_len - o``,
+    giving biological reverse frame
+    ``3 + (seq_len - start_nt - patch_nt_len + o) % 3``.
+    """
+    perm = [0] * 6
+    for f in range(3):
+        bio = (start_nt + f) % 3
+        perm[bio] = f
+    for o in range(3):
+        bio = (seq_len - start_nt - patch_nt_len + o) % 3
+        perm[3 + bio] = 3 + o
+    return perm
+
+
+def squeeze_weights(w_patches, patch_starts, patch_nt_len, seq_len,
+                    compression_factor):
+    """Merge per-patch weight arrays into a genome-wide (positions, 6) array.
+
+    Places each patch's weights at its true compressed position (derived
+    from the patch's nucleotide start coordinate), permutes frame columns
+    to align model channels with biological reading frames, and resolves
+    overlaps with element-wise max.
+
+    Parameters
+    ----------
+    w_patches     : (n_patches, L', 6) array
+    patch_starts  : list of 0-based nucleotide start positions
+    patch_nt_len  : nucleotide length per patch
+    seq_len       : total sequence length in nucleotides
+    compression_factor : CNN compression ratio (e.g. 64)
+    """
     weights_per_patch = (patch_nt_len // 3) // compression_factor
     weights_in_seq = (seq_len // 3) // compression_factor
-    compressed_stride = (stride // 3) // compression_factor
     w_out = np.zeros((weights_in_seq, 6))
-    for i, j in zip(range(0, len(w)-weights_per_patch, compressed_stride), 
-                    range(0, len(w)-weights_per_patch, weights_per_patch)):
-        patch = w[j:j+weights_per_patch]
-        merged_patch = w_out[i:i+weights_per_patch]
-        w_out[i:i+weights_per_patch] = np.maximum(merged_patch, patch)
-    last_patch = w[len(w)-weights_per_patch:]
-    last_merged = w_out[weights_in_seq-weights_per_patch:]
-    w_out[weights_in_seq-weights_per_patch:] = np.maximum(last_merged, last_patch)
+
+    for start_nt, patch_w in zip(patch_starts, w_patches):
+        perm = _frame_permutation(start_nt, patch_nt_len, seq_len)
+        aligned = patch_w[:, perm]
+
+        pos = (start_nt // 3) // compression_factor
+        end = min(pos + weights_per_patch, weights_in_seq)
+        n = end - pos
+        w_out[pos:end] = np.maximum(w_out[pos:end], aligned[:n])
+
     return w_out
         
 
@@ -214,7 +254,7 @@ def combine_weights(weights: dict,
                     branch_pooling_attention: bool = False,
                     encoder_pooling_attention: bool = False,
                     aggregator_attention: bool = False) -> np.ndarray:
-    """Combine per-patch weight layers into a single (total_positions, 6) array.
+    """Combine per-patch weight layers into a (n_patches, L', 6) array.
 
     Starts with the main cross-frame attention (n_patches, L', 6) and
     optionally multiplies in additional weight layers.
@@ -241,7 +281,7 @@ def combine_weights(weights: dict,
     if aggregator_attention:
         w *= weights['agg_w'][:, None, None]               # (n,) → (n, 1, 1)
 
-    return w.reshape(-1, 6)
+    return w
 
 
 @torch.no_grad()
@@ -259,7 +299,7 @@ def annotate_sequence(model, tokenizer, seq: str, patch_nt_len: int,
 
     Returns (total_compressed_positions, 6) array.
     """
-    patches = tile_sequence(seq, patch_nt_len, stride, max_patches)
+    patches, starts = tile_sequence(seq, patch_nt_len, stride, max_patches)
     tokens, counts = tokenize_patches(patches, tokenizer)
     tokens = tokens.to(device, non_blocking=True)
     counts = counts.to(device, non_blocking=True)
@@ -274,7 +314,7 @@ def annotate_sequence(model, tokenizer, seq: str, patch_nt_len: int,
         encoder_pooling_attention=encoder_pooling_attention,
         aggregator_attention=aggregator_attention,
     )
-    return squeeze_weights(w, patch_nt_len, stride, seq_len,
+    return squeeze_weights(w, starts, patch_nt_len, seq_len,
                            compression_factor)
 
 
@@ -463,8 +503,8 @@ def main():
                              'GenBank (.gb/.gbk/.genbank/.gbff). '
                              'Gzipped files supported. GenBank input '
                              'provides CDS annotations directly.')
-    parser.add_argument('--run_dir', type=str, required=True,
-                        help='Training run directory (contains calibration.json)')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Model directory (contains calibration.json and checkpoints/)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--output', '-o', type=str, default='frame_attention.png',
@@ -504,7 +544,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available()
                           or args.device == 'cpu' else 'cpu')
     model, calib = load_model_and_calibration(
-        args.run_dir, args.checkpoint, device)
+        args.model_dir, args.checkpoint, device)
 
     patch_nt_len = calib['model_config']['patch_nt_len']
 
@@ -583,7 +623,6 @@ def main():
             genes = copy.deepcopy(gb_annot[rec['id']])
         elif ext_annot and rec['id'] in ext_annot:
             genes = copy.deepcopy(ext_annot[rec['id']])
-            genes = assign_frame_indices(genes, len(seq))
         else:
             if gb_annot:
                 logger.warning(f"  {rec['id']}: not found in GenBank records, "
@@ -592,6 +631,7 @@ def main():
                 logger.warning(f"  {rec['id']}: not found in external "
                                f"annotations, falling back to pyrodigal")
             genes = predict_genes(seq)
+        genes = assign_frame_indices(genes, len(seq))
 
         annot_genes.append(genes)
         n_fwd = sum(1 for g in genes if g['strand'] == 1)

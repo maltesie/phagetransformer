@@ -2,7 +2,8 @@
 """Inference script for the hierarchical DNA classifier.
 
 Loads a trained model checkpoint + calibration.json, processes FASTA input,
-and outputs per-sequence predictions as TSV.
+and outputs per-sequence predictions as TSV.  Lineage information is
+extracted from the host names stored in calibration.json.
 
 Usage:
     python predict.py --input phages.fasta --model_dir ./models/PT
@@ -51,29 +52,42 @@ def read_fasta(path: str) -> List[dict]:
     return records
 
 
-def load_taxonomy(path: str) -> tuple:
-    """Load hosts.csv -> ({genus: {rank: value, ...}}, [rank_columns]).
+def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
+                   threshold: float, top_k: int) -> List[dict]:
+    """Format predictions for one sequence as list of output rows.
 
-    Auto-detects delimiter (comma or tab).  Columns are expected in
-    taxonomic order (e.g. phylum, class, order, family, genus).
-    The 'genus' and 'species' columns are excluded from the lineage ranks.
-    Returns (tax_dict, ordered_rank_list).
+    Returns only predictions above threshold, sorted by score descending.
+    If top_k > 0, caps output to top_k entries.
+    If nothing is above threshold, returns the single best prediction
+    (marked above_threshold=no).
+
+    The ``genus`` field contains the short genus name (last component
+    of the semicolon-separated lineage), and ``lineage`` contains the
+    full lineage string from calibration.json.
     """
-    with open(path) as fh:
-        sample = fh.read(4096)
-        fh.seek(0)
-        delimiter = '\t' if sample.count('\t') > sample.count(',') else ','
-        reader = csv.DictReader(fh, delimiter=delimiter)
-        reader.fieldnames = [f.strip().lower() for f in reader.fieldnames]
-        skip = {'genus', 'species'}
-        ranks = [c for c in reader.fieldnames if c not in skip]
-        tax = {}
-        for row in reader:
-            genus = row.get('genus', '').strip()
-            if genus:
-                tax[genus] = {k: v.strip() for k, v in row.items()
-                              if k not in skip and v and v.strip()}
-    return tax, ranks
+    above = np.where(probs >= threshold)[0]
+
+    if len(above) == 0:
+        above = np.array([np.argmax(probs)])
+
+    above = above[np.argsort(probs[above])[::-1]]
+
+    if top_k > 0:
+        above = above[:top_k]
+
+    rows = []
+    for idx in above:
+        host = hosts[idx]
+        genus = host.split(';')[-1] if ';' in host else host
+        score = float(probs[idx])
+        rows.append({
+            'sequence_id': seq_id,
+            'genus': genus,
+            'lineage': host,
+            'score': f"{score:.4f}",
+            'above_threshold': 'yes' if score >= threshold else 'no',
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -81,20 +95,32 @@ def load_taxonomy(path: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def tile_sequence(seq: str, patch_nt_len: int, stride: int,
-                  max_patches: int = 512) -> List[str]:
+                  max_patches: int = 512) -> tuple:
+    """Tile a sequence into overlapping patches.
+
+    Returns (patches, starts) where patches is a list of subsequence
+    strings and starts is a list of 0-based nucleotide start positions.
+    """
     plen = patch_nt_len
     patches = []
+    starts = []
     for start in range(0, max(1, len(seq) - plen + 1), stride):
         patches.append(seq[start:start + plen])
+        starts.append(start)
         if len(patches) >= max_patches:
             break
     if len(seq) > plen:
-        last = seq[len(seq) - plen:]
+        last_start = len(seq) - plen
+        last = seq[last_start:]
         if not patches or last != patches[-1]:
             patches.append(last)
+            starts.append(last_start)
     if not patches:
         patches.append(seq)
-    return patches[:max_patches]
+        starts.append(0)
+    patches = patches[:max_patches]
+    starts = starts[:max_patches]
+    return patches, starts
 
 
 def tokenize_patches(patches: List[str], tokenizer: CodonTokenizer) -> tuple:
@@ -162,7 +188,7 @@ def predict_sequence(model, tokenizer, seq: str, patch_nt_len: int,
                      max_patches: int = 512,
                      blocked_classes: Optional[List[int]] = None) -> np.ndarray:
     """Run model on one sequence, return calibrated probabilities (C,)."""
-    patches = tile_sequence(seq, patch_nt_len, stride, max_patches)
+    patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
     tokens, counts = tokenize_patches(patches, tokenizer)
     tokens = tokens.to(device, non_blocking=True)
     counts = counts.to(device, non_blocking=True)
@@ -182,7 +208,7 @@ def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
     """Batch prediction for multiple sequences. Returns (B, C) probabilities."""
     all_patches, all_counts = [], []
     for seq in seqs:
-        patches = tile_sequence(seq, patch_nt_len, stride, max_patches)
+        patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
         toks = [tokenizer.tokenize(p) for p in patches]
         all_patches.append(toks)
         all_counts.append(len(toks))
@@ -325,26 +351,13 @@ def main():
     if blocked_classes:
         logger.info(f"  {len(blocked_classes)} blocked classes (low val precision)")
 
-    # ---- taxonomy (hosts.csv in model_dir) ------------------------------------
-    taxonomy = None
-    lineage_ranks = []
-    hosts_csv = os.path.join(args.model_dir, 'hosts.csv')
-    if os.path.exists(hosts_csv):
-        taxonomy, lineage_ranks = load_taxonomy(hosts_csv)
-        logger.info(f"Loaded taxonomy for {len(taxonomy)} genera "
-                    f"(ranks: {', '.join(lineage_ranks)})")
-    else:
-        logger.info(f"No hosts.csv in {args.model_dir} — skipping lineage")
-
     # ---- read input ------------------------------------------------------
     logger.info(f"Reading {args.input} …")
     records = read_fasta(args.input)
     logger.info(f"  {len(records)} sequences")
 
     # ---- prepare output --------------------------------------------------
-    fieldnames = ['sequence_id', 'genus', 'score', 'above_threshold']
-    if taxonomy:
-        fieldnames.append('lineage')
+    fieldnames = ['sequence_id', 'genus', 'lineage', 'score', 'above_threshold']
 
     out_fh = open(args.output, 'w', newline='') if args.output else sys.stdout
     writer = csv.DictWriter(out_fh, fieldnames=fieldnames, delimiter='\t')
@@ -359,8 +372,7 @@ def main():
                 model, tokenizer, rec['seq'], patch_nt_len, stride,
                 temperature, device, args.max_patches, blocked_classes)
             rows = format_results(
-                rec['id'], probs, hosts, threshold, top_k,
-                taxonomy, lineage_ranks)
+                rec['id'], probs, hosts, threshold, top_k)
             for row in rows:
                 writer.writerow(row)
 
@@ -375,8 +387,7 @@ def main():
                 temperature, device, args.max_patches, blocked_classes)
             for rec, probs in zip(batch_recs, all_probs):
                 rows = format_results(
-                    rec['id'], probs, hosts, threshold, top_k,
-                    taxonomy, lineage_ranks)
+                    rec['id'], probs, hosts, threshold, top_k)
                 for row in rows:
                     writer.writerow(row)
 
