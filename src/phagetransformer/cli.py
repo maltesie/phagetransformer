@@ -6,8 +6,6 @@ Usage:
     phagetransformer predict   --input phages.fasta --model_dir ./models
     phagetransformer train     --dataset_dir ./data --host_genome_dir ./genomes
     phagetransformer annotate  --input phage.gb --model_dir ./models
-    phagetransformer extract   --input bacterium.fasta --model_dir ./models
-    phagetransformer evaluate  --input test.fasta --model_dir ./models
 """
 
 import sys
