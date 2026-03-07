@@ -9,13 +9,13 @@ A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophag
 Requires Python ≥ 3.10 and PyTorch ≥ 2.0.
 
 ```bash
-pip install git+https://github.com/yourname/phagetransformer.git
+pip install git+https://github.com/maltesie/phagetransformer.git
 ```
 
 For genome annotation with automatic gene prediction (pyrodigal):
 
 ```bash
-pip install "phagetransformer[annotate] @ git+https://github.com/yourname/phagetransformer.git"
+pip install "phagetransformer[annotate] @ git+https://github.com/maltesie/phagetransformer.git"
 ```
 
 ### GPU support
