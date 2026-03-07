@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""Evaluate a trained PhageTransformer model and produce publication-quality figures.
-
-Loads the best checkpoint from a training run, evaluates on the validation set,
-computes metrics at every taxonomic level (genus -> family -> order -> class ->
-phylum), and produces two multi-panel summary figures in <run_dir>/plots/.
-
-Figure 1 - Training:   loss curves, validation F1, calibration diagram
-Figure 2 - Evaluation: metrics by taxonomic level, F1 distributions,
-                        performance vs. distance to training data
+"""Evaluate a trained PhageTransformer model and produce figures.
 
 Usage:
-    python evaluate.py --run_dir ./models/my_run
+    python evaluate.py --model_dir ./models/my_training_run
 """
 
 import argparse
