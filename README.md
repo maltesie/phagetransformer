@@ -16,7 +16,7 @@ conda create -n phagetransformer python=3.11
 conda activate phagetransformer
 
 # Or using venv
-python -m venv .venv && source .venv/bin/activate
+python -m venv ptenv && source ptenv/bin/activate
 
 # Install the package
 pip install git+https://github.com/yourname/phagetransformer.git
@@ -29,14 +29,14 @@ PhageTransformer uses PyTorch and will automatically use CUDA if available. For 
 ## Quickstart
 
 ```bash
-# Download pre-trained model weights (~100 MB)
+# Download pre-trained model weights into ~/.local/share/phagetransformer/default (~100 MB)
 phagetransformer init
 
 # Or download to a specific directory
 phagetransformer init --model_dir ./models/PT
 
 # Predict hosts for phage genomes
-phagetransformer predict --input phages.fasta --model_dir ~/.local/share/phagetransformer/default
+phagetransformer predict --input phages.fasta --model_dir ./models/PT
 
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
