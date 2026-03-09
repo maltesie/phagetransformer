@@ -172,7 +172,7 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 After training, the model directory (`--model_dir`) contains everything needed for inference:
 
 ```
-models/PT/
+{model_dir}/{run_name}/
 ├── calibration.json       # Temperature, thresholds, model config, host list
 ├── checkpoints/
 │   ├── best_encoder.pt
