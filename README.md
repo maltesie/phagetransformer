@@ -180,6 +180,7 @@ models/PT/
 │   └── ...
 └── logs/
     ├── metrics.csv
+    ├── train.log
     └── bacterial_species.tsv
 ```
 
