@@ -8,14 +8,18 @@ A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophag
 
 Requires Python ≥ 3.10 and PyTorch ≥ 2.0.
 
+Create and activate a fresh environment (conda or venv), then install:
+
 ```bash
+# Using conda
+conda create -n phagetransformer python=3.11
+conda activate phagetransformer
+
+# Or using venv
+python -m venv .venv && source .venv/bin/activate
+
+# Install the package
 pip install git+https://github.com/yourname/phagetransformer.git
-```
-
-For attention visualization with automatic gene prediction, also install pyrodigal:
-
-```bash
-pip install pyrodigal
 ```
 
 ### GPU support
@@ -36,12 +40,6 @@ phagetransformer predict --input phages.fasta --model_dir ~/.local/share/phagetr
 
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
-
-# Visualise attention weights (standalone script)
-python scripts/attention.py --input phage.gb --model_dir ./models/PT
-
-# Scan for prophage regions (standalone script)
-python scripts/scan.py --input bacterium.fasta --model_dir ./models/PT
 ```
 
 All commands accept `--help` for full option details:
@@ -183,87 +181,6 @@ models/PT/
 └── logs/
     ├── metrics.csv
     └── bacterial_species.tsv
-```
-
-## Standalone scripts
-
-The `scripts/` directory contains visualization and evaluation tools that are not part of the installed package. They require the package to be installed and import from it.
-
-### attention.py
-
-Visualise per-frame attention weights across a genome as heatmaps, with predicted or annotated coding regions overlaid.
-
-```bash
-# FASTA input — genes predicted automatically with pyrodigal
-python scripts/attention.py --input phages.fasta --model_dir ./models/PT
-
-# GenBank input — CDS annotations extracted from the file
-python scripts/attention.py --input phage.gb --model_dir ./models/PT
-
-# External protein annotations
-python scripts/attention.py --input phages.fasta --model_dir ./models/PT \
-    --protein_annotations proteins.tsv
-```
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--input`, `-i` | *required* | Input FASTA or GenBank file |
-| `--model_dir` | *required* | Model directory |
-| `--output`, `-o` | frame_attention.png | Output plot filename |
-| `--first_n` | 10 | Number of sequences to annotate |
-| `--protein_annotations` | — | External annotation TSV (columns: gene, start, stop, strand, contig, annot, category) |
-| `--top_n` | 3 | Label the n highest-attention genes on the plot |
-| `--normalize_importance` | off | Normalize weights to [0, 1] per genome |
-
-The default plot shows the main cross-frame attention weights. Additional attention layers from the model can be combined to produce different views of the data:
-
-| Flag | Effect |
-|---|---|
-| `--branch_cross_attention` | Average in the frame-stats branch's cross-frame attention (consensus of both branches) |
-| `--branch_pooling_attention` | Multiply by the branch's position-level pooling weights |
-| `--encoder_pooling_attention` | Multiply by the main encoder's position-level pooling weights |
-| `--aggregator_attention` | Multiply by the aggregator's patch-level pooling weights |
-
-These flags are combinable. Same-type layers (e.g. both pooling paths) are averaged for consensus; cross-type layers (frame × pooling × aggregator) are multiplied for joint importance.
-
-### scan.py
-
-Scan bacterial genomes for candidate prophage regions using a sliding window approach.
-
-```bash
-python scripts/scan.py --input bacterium.fasta --model_dir ./models/PT
-python scripts/scan.py --input bacterium.gb --model_dir ./models/PT \
-    --window_size 120000 --stride 60000 --threshold 0.3
-```
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--input`, `-i` | *required* | Input FASTA or GenBank file |
-| `--model_dir` | *required* | Model directory |
-| `--output`, `-o` | prophage_scan.png | Output plot filename |
-| `--output_tsv` | auto | Output TSV of detected regions |
-| `--window_size` | 100000 | Sliding window size in nucleotides |
-| `--stride` | window_size/2 | Window step size in nucleotides |
-| `--threshold` | 0.5 | Confidence threshold for prophage regions |
-| `--min_region` | 5000 | Minimum region size (nt) to report |
-| `--merge_gap` | 5000 | Merge regions separated by less than this distance |
-
-### evaluate.py
-
-Evaluate a trained model, producing per-class metrics and diagnostic figures.
-
-```bash
-python scripts/evaluate.py --model_dir ./models/PT \
-    --dataset_dir ./data --testset_dir ./testset
-```
-
-### compare.py
-
-Generate a tool comparison figure (PhageTransformer vs iPHoP vs CHERRY).
-
-```bash
-python scripts/compare.py --model_dir ./models/PT \
-    --compare_dir ./eval_combined --testset_dir ./testset
 ```
 
 ## Citation
