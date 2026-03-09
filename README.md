@@ -1,21 +1,21 @@
 # PhageTransformer
 
-THIS IS NOT WORKING YET. WILL REMOVE THIS HINT WHEN IT DOES.
+THIS IS STILL WORK IN PROGRESS. WILL REMOVE THIS HINT WHEN EVERYTHING WORKS.
 
-A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences across all six reading frames, using a codon-level tokenizer, per-frame CNNs, cross-frame attention, and a multi-level transformer architecture to produce multi-label host genus predictions.
+A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences into trinucleotides across all six reading frames, using a codon-level tokenizer, per-frame CNNs, cross-frame attention, and a multi-level transformer architecture to produce multi-label host genus predictions.
 
 ## Installation
 
 Requires Python ≥ 3.10 and PyTorch ≥ 2.0.
 
 ```bash
-pip install git+https://github.com/maltesie/phagetransformer.git
+pip install git+https://github.com/yourname/phagetransformer.git
 ```
 
-For genome annotation with automatic gene prediction (pyrodigal):
+For attention visualization with automatic gene prediction, also install pyrodigal:
 
 ```bash
-pip install "phagetransformer[annotate] @ git+https://github.com/maltesie/phagetransformer.git"
+pip install pyrodigal
 ```
 
 ### GPU support
@@ -34,11 +34,14 @@ phagetransformer init --model_dir ./models/PT
 # Predict hosts for phage genomes
 phagetransformer predict --input phages.fasta --model_dir ~/.local/share/phagetransformer/default
 
-# Annotate genomes with reading-frame attention heatmaps
-phagetransformer annotate --input phage.gb --model_dir ~/.local/share/phagetransformer/default
-
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
+
+# Visualise attention weights (standalone script)
+python scripts/attention.py --input phage.gb --model_dir ./models/PT
+
+# Scan for prophage regions (standalone script)
+python scripts/scan.py --input bacterium.fasta --model_dir ./models/PT
 ```
 
 All commands accept `--help` for full option details:
@@ -91,43 +94,6 @@ phagetransformer predict --input phages.fasta --model_dir ./models/PT
 | `--device` | cuda | Device (cuda or cpu) |
 
 The `--fdr` option uses thresholds computed during training calibration. Available FDR levels depend on the training run (typically 10% and 20%).
-
-### annotate
-
-Visualise per-frame attention weights across a genome as heatmaps, with predicted or annotated coding regions overlaid. Useful for understanding which reading frames the model attends to and how this correlates with actual gene locations.
-
-```bash
-# FASTA input — genes predicted automatically with pyrodigal
-phagetransformer annotate --input phages.fasta --model_dir ./models/PT
-
-# GenBank input — CDS annotations extracted from the file
-phagetransformer annotate --input phage.gb --model_dir ./models/PT
-
-# External protein annotations
-phagetransformer annotate --input phages.fasta --model_dir ./models/PT \
-    --protein_annotations proteins.tsv
-```
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--input`, `-i` | *required* | Input FASTA or GenBank file |
-| `--model_dir` | *required* | Model directory |
-| `--output`, `-o` | frame_attention.png | Output plot filename |
-| `--first_n` | 10 | Number of sequences to annotate |
-| `--protein_annotations` | — | External annotation TSV (columns: gene, start, stop, strand, contig, annot, category) |
-| `--top_n` | 3 | Label the n highest-attention genes on the plot |
-| `--normalize_importance` | off | Normalize weights to [0, 1] per genome |
-
-The default plot shows the main cross-frame attention weights. Additional attention layers from the model can be multiplied in to produce different views of the data:
-
-| Flag | Effect |
-|---|---|
-| `--branch_cross_attention` | Include the frame-stats branch's cross-frame attention |
-| `--branch_pooling_attention` | Include the branch's position-level pooling weights |
-| `--encoder_pooling_attention` | Include the main encoder's position-level pooling weights |
-| `--aggregator_attention` | Include the aggregator's patch-level pooling weights |
-
-These flags are combinable — each active layer is multiplied into the base cross-frame attention, producing increasingly specific importance maps.
 
 ### train
 
@@ -205,7 +171,7 @@ The training data directory (`--dataset_dir`) should contain `train.fna.gz`, `te
 
 ## Model directory structure
 
-After training, the model directory (`--run_dir`) contains everything needed for inference:
+After training, the model directory (`--model_dir`) contains everything needed for inference:
 
 ```
 models/PT/
@@ -217,6 +183,87 @@ models/PT/
 └── logs/
     ├── metrics.csv
     └── bacterial_species.tsv
+```
+
+## Standalone scripts
+
+The `scripts/` directory contains visualization and evaluation tools that are not part of the installed package. They require the package to be installed and import from it.
+
+### attention.py
+
+Visualise per-frame attention weights across a genome as heatmaps, with predicted or annotated coding regions overlaid.
+
+```bash
+# FASTA input — genes predicted automatically with pyrodigal
+python scripts/attention.py --input phages.fasta --model_dir ./models/PT
+
+# GenBank input — CDS annotations extracted from the file
+python scripts/attention.py --input phage.gb --model_dir ./models/PT
+
+# External protein annotations
+python scripts/attention.py --input phages.fasta --model_dir ./models/PT \
+    --protein_annotations proteins.tsv
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--input`, `-i` | *required* | Input FASTA or GenBank file |
+| `--model_dir` | *required* | Model directory |
+| `--output`, `-o` | frame_attention.png | Output plot filename |
+| `--first_n` | 10 | Number of sequences to annotate |
+| `--protein_annotations` | — | External annotation TSV (columns: gene, start, stop, strand, contig, annot, category) |
+| `--top_n` | 3 | Label the n highest-attention genes on the plot |
+| `--normalize_importance` | off | Normalize weights to [0, 1] per genome |
+
+The default plot shows the main cross-frame attention weights. Additional attention layers from the model can be combined to produce different views of the data:
+
+| Flag | Effect |
+|---|---|
+| `--branch_cross_attention` | Average in the frame-stats branch's cross-frame attention (consensus of both branches) |
+| `--branch_pooling_attention` | Multiply by the branch's position-level pooling weights |
+| `--encoder_pooling_attention` | Multiply by the main encoder's position-level pooling weights |
+| `--aggregator_attention` | Multiply by the aggregator's patch-level pooling weights |
+
+These flags are combinable. Same-type layers (e.g. both pooling paths) are averaged for consensus; cross-type layers (frame × pooling × aggregator) are multiplied for joint importance.
+
+### scan.py
+
+Scan bacterial genomes for candidate prophage regions using a sliding window approach.
+
+```bash
+python scripts/scan.py --input bacterium.fasta --model_dir ./models/PT
+python scripts/scan.py --input bacterium.gb --model_dir ./models/PT \
+    --window_size 120000 --stride 60000 --threshold 0.3
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--input`, `-i` | *required* | Input FASTA or GenBank file |
+| `--model_dir` | *required* | Model directory |
+| `--output`, `-o` | prophage_scan.png | Output plot filename |
+| `--output_tsv` | auto | Output TSV of detected regions |
+| `--window_size` | 100000 | Sliding window size in nucleotides |
+| `--stride` | window_size/2 | Window step size in nucleotides |
+| `--threshold` | 0.5 | Confidence threshold for prophage regions |
+| `--min_region` | 5000 | Minimum region size (nt) to report |
+| `--merge_gap` | 5000 | Merge regions separated by less than this distance |
+
+### evaluate.py
+
+Evaluate a trained model, producing per-class metrics and diagnostic figures.
+
+```bash
+python scripts/evaluate.py --model_dir ./models/PT \
+    --dataset_dir ./data --testset_dir ./testset
+```
+
+### compare.py
+
+Generate a tool comparison figure (PhageTransformer vs iPHoP vs CHERRY).
+
+```bash
+python scripts/compare.py --model_dir ./models/PT \
+    --compare_dir ./eval_combined --testset_dir ./testset
 ```
 
 ## Citation

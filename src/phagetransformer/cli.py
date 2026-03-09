@@ -5,7 +5,6 @@ Usage:
     phagetransformer init                                      # download model
     phagetransformer predict   --input phages.fasta --model_dir ./models
     phagetransformer train     --dataset_dir ./data --host_genome_dir ./genomes
-    phagetransformer annotate  --input phage.gb --model_dir ./models
 """
 
 import sys
@@ -16,8 +15,6 @@ def main():
         'init':     ('phagetransformer.init_model', 'Download pre-trained model weights'),
         'predict':  ('phagetransformer.predict',    'Predict phage hosts'),
         'train':    ('phagetransformer.train',      'Train a new model'),
-        'annotate': ('phagetransformer.annotate',   'Annotate genomes with attention weights'),
-        'evaluate': ('phagetransformer.evaluate',   'Evaluate training run')
     }
 
     if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
@@ -25,7 +22,6 @@ def main():
         print("Usage: phagetransformer <command> [options]\n")
         print("Commands:")
         for cmd, (_, desc) in commands.items():
-            if cmd == "evaluate": continue
             print(f"  {cmd:<12s} {desc}")
         print(f"\nRun 'phagetransformer <command> --help' for command-specific options.")
         sys.exit(0)

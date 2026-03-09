@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Evaluate a trained PhageTransformer model and produce figures.
 
+Standalone script — not part of the installed package.
+
 Usage:
     python evaluate.py --model_dir ./models/my_training_run
 """
 
 import argparse
-import gzip
-import json
 import logging
 import os
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -20,410 +19,22 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from Bio import SeqIO
 from torch.utils.data import DataLoader
 
-from .model import CodonTokenizer
-from .predict import load_model_and_calibration
-from .dataset import (
+from phagetransformer.model import CodonTokenizer
+from phagetransformer.predict import load_model_and_calibration
+from phagetransformer.dataset import (
     load_phage_host_merged, load_phage_host_test,
     PatchSequenceDataset, sequence_collate_fn,
 )
-from .train import _unpack_sequence_batch
+from eval_utils import (
+    COLORS, METRIC_COLORS, LEVEL_NAMES, FONT_SIZES, PRESENTATION_MODE,
+    setup_style, _add_panel_letters, _output_path, _suptitle,
+    enable_presentation_mode,
+    collect_logits, evaluate_all_levels, compute_real_support,
+)
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Color theme
-# ---------------------------------------------------------------------------
-
-COLORS = {
-    'primary':    '#2C5F8A',
-    'secondary':  '#D4563E',
-    'tertiary':   '#3A8A6E',
-    'quaternary': '#E8983E',
-    'quinary':    '#7B5EA7',
-    'senary':     '#C47BA0',
-    #'light_bg':   '#F5F5F2',
-    'light_bg':   '#FFFFFF',
-    'grid':       '#D0CFC8',
-    'text':       '#2D2D2D',
-    'text_light': '#6B6B6B',
-}
-
-METRIC_COLORS = {
-    'micro_f1': COLORS['primary'],
-    'macro_f1': COLORS['secondary'],
-    'micro_p':  COLORS['tertiary'],
-    'micro_r':  COLORS['quaternary'],
-    'macro_p':  COLORS['quinary'],
-    'macro_r':  COLORS['senary'],
-}
-
-LEVEL_NAMES = ['Phylum', 'Class', 'Order', 'Family', 'Genus']
-
-# ---------------------------------------------------------------------------
-# Central font-size definitions
-# ---------------------------------------------------------------------------
-
-FONT_SIZES = {
-    'base':           11,    # mpl font.size
-    'suptitle':       12,    # figure suptitle
-    'title':          11,    # axes title
-    'label':          11,    # axes label
-    'tick':           10,    # standard tick labels
-    'tick_small':      9,    # smaller tick labels (grouped bars, box plots)
-    'tick_tiny':       7.5,  # very small tick labels (distance bins)
-    'legend':         10,    # standard legend
-    'legend_small':    8,    # compact legends inside dense panels
-    'annotation':      8,    # in-plot text (ECE, silhouette, etc.)
-    'bar_value':       6,    # tiny value labels on bars
-    'bar_label':       7,    # n= labels below grouped bars
-    'panel_letter':   13,    # A, B, C, D panel labels
-    'codon':           5.5,  # codon annotations on embedding plots
-    'colorbar':        9,    # colorbar label
-    'secondary_axis':  7,    # twin-axis labels and ticks
-    'fallback_msg':   10,    # "no data available" placeholder text
-}
-
-PRESENTATION_MODE = False
-
-
-def setup_style():
-    """Configure matplotlib for publication-quality output."""
-    mpl.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Helvetica'],
-        'font.size': FONT_SIZES['base'],
-        'axes.titlesize': FONT_SIZES['title'],
-        'axes.titleweight': 'bold',
-        'axes.labelsize': FONT_SIZES['label'],
-        'axes.labelcolor': COLORS['text'],
-        'axes.edgecolor': COLORS['grid'],
-        'axes.facecolor': 'white',
-        'axes.grid': True,
-        'axes.grid.axis': 'y',
-        'grid.color': COLORS['grid'],
-        'grid.linewidth': 0.5,
-        'grid.alpha': 0.6,
-        'xtick.labelsize': FONT_SIZES['tick'],
-        'ytick.labelsize': FONT_SIZES['tick'],
-        'xtick.color': COLORS['text_light'],
-        'ytick.color': COLORS['text_light'],
-        'legend.fontsize': FONT_SIZES['legend'],
-        'legend.frameon': True,
-        'legend.framealpha': 0.9,
-        'legend.edgecolor': COLORS['grid'],
-        'figure.facecolor': COLORS['light_bg'],
-        'savefig.facecolor': COLORS['light_bg'],
-        'savefig.bbox': 'tight',
-        'savefig.pad_inches': 0.15,
-    })
-
-
-def _add_panel_letters(axes, letters='ABCDEFGH', x=-0.06, y=1.06):
-    """Add panel letters (A, B, C, ...) unless in presentation mode."""
-    if PRESENTATION_MODE:
-        return
-    for ax, letter in zip(axes, letters):
-        ax.text(x, y, letter, transform=ax.transAxes,
-                fontsize=FONT_SIZES['panel_letter'], fontweight='bold',
-                color=COLORS['text'], va='top', ha='right')
-
-
-def _output_path(base_path: str) -> str:
-    """Adjust output filename for presentation mode."""
-    if not PRESENTATION_MODE:
-        return base_path
-    root, ext = os.path.splitext(base_path)
-    return f'{root}_presentation{ext}'
-
-
-def _suptitle(fig, title: str, **kwargs):
-    """Add figure suptitle unless in presentation mode."""
-    if PRESENTATION_MODE:
-        return
-    kwargs.setdefault('fontsize', FONT_SIZES['suptitle'])
-    kwargs.setdefault('fontweight', 'bold')
-    kwargs.setdefault('color', COLORS['text'])
-    fig.suptitle(title, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Model + data loading
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def collect_logits(model, loader, device):
-    """Run model on loader, return (logits, labels) on CPU."""
-    model.eval()
-    all_logits, all_labels = [], []
-    for batch in loader:
-        logits, labels = _unpack_sequence_batch(model, batch, device)
-        all_logits.append(logits.cpu())
-        all_labels.append(labels.cpu())
-    return torch.cat(all_logits), torch.cat(all_labels)
-
-
-def load_test_with_ids(ts_path: str, hosts: np.ndarray
-                       ) -> Tuple[List[str], List[str], List[str],
-                                  np.ndarray]:
-    """Load the external test set preserving sequence IDs and dataset labels.
-
-    Returns
-    -------
-    seq_ids  : list of FASTA record IDs
-    seqs     : list of nucleotide sequences
-    datasets : list of dataset labels (cow_fecal, human_gut, …)
-    labels   : (N, C) multi-hot label matrix
-    """
-    fasta_path = os.path.join(ts_path, 'combined.fna.gz')
-    csv_path = os.path.join(ts_path, 'combined_lineage.csv')
-
-    # Read FASTA with IDs
-    seq_ids, seqs = [], []
-    with gzip.open(fasta_path, 'rt') as fh:
-        for rec in SeqIO.parse(fh, 'fasta'):
-            seq_ids.append(rec.id)
-            seqs.append(str(rec.seq))
-
-    # Read lineage metadata
-    df = pd.read_csv(csv_path, delimiter=',', dtype=str)
-
-    # Build label matrix
-    genus_index = {x: i for i, x in enumerate(hosts)}
-    labels = np.zeros((len(df), len(genus_index)), dtype=np.float32)
-    for i, hs in enumerate(df['host_genus_lineage']):
-        for h in hs.split('|'):
-            h_trunc = ';'.join(h.split(';')[1:])  # drop domain prefix
-            if h_trunc in genus_index:
-                labels[i, genus_index[h_trunc]] = 1
-
-    datasets = df['dataset'].tolist()
-    return seq_ids, seqs, datasets, labels
-
-
-def predict_test_for_comparison(
-        model, seqs: List[str], seq_ids: List[str],
-        hosts: np.ndarray, temperature: float,
-        tokenizer, device: torch.device,
-        patch_nt_len: int = 4096, max_patches: int = 512,
-        eval_stride: Optional[int] = None,
-        batch_size: int = 8, num_workers: int = 4,
-) -> pd.DataFrame:
-    """Run model inference on test sequences and return predictions DataFrame.
-
-    Returns DataFrame with columns: sequence_id, genus, score, is_bacterial.
-    ``is_bacterial`` is True when the bacterial_fragment class probability
-    exceeds the best genus probability (model thinks the input is bacterial
-    DNA, not a phage).  One row per sequence (top-1 genus prediction).
-    """
-    # Build dummy labels (not needed for prediction, but DataLoader expects them)
-    dummy_labels = np.zeros((len(seqs), len(hosts)), dtype=np.float32)
-
-    stride = eval_stride or patch_nt_len // 2
-    ds = PatchSequenceDataset(
-        seqs, dummy_labels, tokenizer,
-        patch_nt_len=patch_nt_len, max_patches=max_patches,
-        is_train=False, eval_stride=stride,
-    )
-    ldr_kw = dict(num_workers=num_workers, pin_memory=True,
-                  persistent_workers=num_workers > 0)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        collate_fn=sequence_collate_fn, **ldr_kw)
-
-    logger.info(f"  Running PT inference on {len(seqs)} test sequences ...")
-    logits, _ = collect_logits(model, loader, device)
-    all_probs = torch.sigmoid(logits / temperature)
-
-    # Check if model has a bacterial_fragment class (last column beyond hosts)
-    n_core = len(hosts)
-    has_bact_class = all_probs.shape[1] > n_core
-
-    # Core genus probabilities (excluding bacterial_fragment)
-    core_probs = all_probs[:, :n_core]
-    best_scores, best_indices = core_probs.max(dim=1)
-
-    rows = []
-    for i in range(len(seqs)):
-        is_bact = False
-        if has_bact_class:
-            is_bact = all_probs[i, n_core].item() > best_scores[i].item()
-        rows.append({
-            'sequence_id': seq_ids[i],
-            'genus': hosts[best_indices[i].item()],
-            'score': best_scores[i].item(),
-            'is_bacterial': is_bact,
-        })
-
-    df = pd.DataFrame(rows)
-    n_bact = df['is_bacterial'].sum()
-    if n_bact:
-        logger.info(f"  {n_bact} / {len(df)} sequences flagged as "
-                    f"bacterial_fragment")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Taxonomic aggregation
-# ---------------------------------------------------------------------------
-
-def parse_lineages(hosts: List[str]) -> Tuple[int, List[List[str]]]:
-    """Parse semicolon-delimited lineage strings."""
-    lineages = []
-    max_depth = 0
-    for h in hosts:
-        parts = h.split(';')
-        lineages.append(parts)
-        max_depth = max(max_depth, len(parts))
-    return max_depth, lineages
-
-
-def aggregate_to_level(probs: torch.Tensor, labels: torch.Tensor,
-                       lineages: List[List[str]], level: int
-                       ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    """Aggregate genus-level predictions/labels to a higher taxonomic level."""
-    taxon_to_indices = defaultdict(list)
-    for idx, lin in enumerate(lineages):
-        if level < len(lin):
-            key = ';'.join(lin[:level + 1])
-        else:
-            key = ';'.join(lin)
-        taxon_to_indices[key].append(idx)
-
-    taxon_names = sorted(taxon_to_indices.keys())
-    n_taxa = len(taxon_names)
-    N = probs.shape[0]
-
-    agg_probs = torch.zeros(N, n_taxa)
-    agg_labels = torch.zeros(N, n_taxa)
-
-    for ti, taxon in enumerate(taxon_names):
-        indices = taxon_to_indices[taxon]
-        agg_probs[:, ti] = probs[:, indices].max(dim=1).values
-        agg_labels[:, ti] = labels[:, indices].max(dim=1).values
-
-    return agg_probs, agg_labels, taxon_names
-
-
-def compute_level_metrics(probs: torch.Tensor, labels: torch.Tensor,
-                          threshold: float) -> Dict[str, float]:
-    """Compute micro and macro metrics from probabilities and binary labels."""
-    preds = (probs >= threshold).float()
-    tp = (preds * labels).sum(0)
-    fp = (preds * (1 - labels)).sum(0)
-    fn = ((1 - preds) * labels).sum(0)
-
-    tp_s, fp_s, fn_s = tp.sum(), fp.sum(), fn.sum()
-    micro_p = (tp_s / (tp_s + fp_s).clamp(min=1)).item()
-    micro_r = (tp_s / (tp_s + fn_s).clamp(min=1)).item()
-    micro_f1 = 2 * micro_p * micro_r / max(micro_p + micro_r, 1e-8)
-
-    has = (tp + fn) > 0
-    per_p = tp / (tp + fp).clamp(min=1)
-    per_r = tp / (tp + fn).clamp(min=1)
-    per_f1 = 2 * per_p * per_r / (per_p + per_r).clamp(min=1e-8)
-
-    macro_p = per_p[has].mean().item() if has.any() else 0.0
-    macro_r = per_r[has].mean().item() if has.any() else 0.0
-    macro_f1 = per_f1[has].mean().item() if has.any() else 0.0
-
-    return {
-        'micro_f1': micro_f1, 'micro_p': micro_p, 'micro_r': micro_r,
-        'macro_f1': macro_f1, 'macro_p': macro_p, 'macro_r': macro_r,
-        'n_taxa': int(has.sum()),
-        'per_f1': per_f1.numpy(), 'per_p': per_p.numpy(), 'per_r': per_r.numpy(),
-        'support': (tp + fn).numpy(),
-    }
-
-
-def evaluate_all_levels(logits: torch.Tensor, labels: torch.Tensor,
-                        hosts: List[str], temperature: float,
-                        threshold: float) -> Dict[str, Dict]:
-    """Compute metrics at every taxonomic level."""
-    probs = torch.sigmoid(logits / temperature)
-    max_depth, lineages = parse_lineages(hosts)
-
-    results = {}
-    for level in range(max_depth):
-        name = LEVEL_NAMES[level] if level < len(LEVEL_NAMES) else f'Level_{level}'
-        if level == max_depth - 1:
-            metrics = compute_level_metrics(probs, labels, threshold)
-            metrics['taxon_names'] = list(hosts)
-        else:
-            agg_p, agg_l, taxa = aggregate_to_level(probs, labels, lineages, level)
-            metrics = compute_level_metrics(agg_p, agg_l, threshold)
-            metrics['taxon_names'] = taxa
-        results[name] = metrics
-        logger.info(f"  {name:8s}: n_taxa={metrics['n_taxa']:4d}  "
-                    f"micro-F1={metrics['micro_f1']:.4f}  "
-                    f"macro-F1={metrics['macro_f1']:.4f}  "
-                    f"P={metrics['micro_p']:.4f}  R={metrics['micro_r']:.4f}")
-
-    return results
-
-
-def compute_real_support(full_metadata_df: pd.DataFrame,
-                         level_results: Dict[str, Dict],
-                         hosts: List[str]) -> Dict[str, np.ndarray]:
-    """Count actual per-class support from the full metadata CSV.
-
-    Returns a dict mapping level name -> np.ndarray of the same length as
-    the taxon list in level_results, with real sample counts.
-    """
-    col = 'host_genus_lineage'
-    if full_metadata_df is None or col not in full_metadata_df.columns:
-        return {}
-
-    # Count per-genus from metadata
-    genus_counts = defaultdict(int)
-    for lineages_str in full_metadata_df[col].dropna():
-        for lin in lineages_str.split('|'):
-            genus_counts[lin] += 1
-
-    # Build real support for genus level
-    genus_res = level_results.get('Genus', {})
-    if not genus_res:
-        return {}
-
-    taxa = genus_res['taxon_names']
-    genus_support = np.array([genus_counts.get(t, 0) for t in taxa],
-                             dtype=float)
-
-    real_support = {'Genus': genus_support}
-
-    # Aggregate to higher levels using the same taxon groupings
-    _, lineages = parse_lineages(hosts)
-    for level_name, metrics in level_results.items():
-        if level_name == 'Genus':
-            continue
-        level_taxa = metrics['taxon_names']
-        # Find which level index this is
-        level_idx = LEVEL_NAMES.index(level_name) if level_name in LEVEL_NAMES \
-            else None
-        if level_idx is None:
-            continue
-
-        taxon_to_genera = defaultdict(set)
-        for idx, lin in enumerate(lineages):
-            if level_idx < len(lin):
-                key = ';'.join(lin[:level_idx + 1])
-            else:
-                key = ';'.join(lin)
-            taxon_to_genera[key].add(idx)
-
-        level_sup = np.zeros(len(level_taxa))
-        taxa_lookup = {t: i for i, t in enumerate(taxa)}
-        for ti, taxon in enumerate(level_taxa):
-            genus_indices = taxon_to_genera.get(taxon, set())
-            for gi in genus_indices:
-                if gi < len(taxa):
-                    level_sup[ti] += genus_support[gi]
-        real_support[level_name] = level_sup
-
-    return real_support
-
 
 # ---------------------------------------------------------------------------
 # Training history
@@ -678,26 +289,17 @@ def plot_support_vs_f1(ax, level_results: Dict[str, Dict],
 # Distance-to-training panels
 # ---------------------------------------------------------------------------
 
-def _compute_best_pred_correctness(raw_logits, labels, temperature, pcut):
-    """Per-sample prediction flags for distance analysis."""
-    logits = raw_logits / temperature
-    probs = torch.sigmoid(logits)
-    best_preds = probs.argmax(dim=1)
-    best_scores = probs[range(len(best_preds)), best_preds]
+def _compute_any_pred_correctness(raw_logits, labels, temperature, pcut):
+    """Per-sample prediction flags: correct if ANY above-threshold pred is true.
 
-    true_probs = [
-        p[l] for p, l in zip(
-            probs.detach().cpu().numpy(),
-            np.array(labels.detach().cpu().numpy(), dtype=bool),
-        )
-    ]
+    Returns (has_prediction, is_correct) boolean tensors of shape (N,).
+    """
+    probs = torch.sigmoid(raw_logits / temperature)
+    labels_bool = labels.bool()
 
-    has_prediction = best_scores >= pcut
-    is_best = torch.tensor([
-        any(bs == ts for ts in tss)
-        for bs, tss in zip(best_scores.detach().cpu().numpy(), true_probs)
-    ])
-    is_correct = has_prediction & is_best
+    has_prediction = (probs >= pcut).any(dim=1)
+    is_correct = ((probs >= pcut) & labels_bool).any(dim=1)
+
     return has_prediction, is_correct
 
 
@@ -740,7 +342,7 @@ def plot_distance_panels(ax_prot, ax_ani, metadata_df,
                          raw_logits, labels, temperature, pcut,
                          binsize=0.1):
     """Performance vs. distance to training data on two axes."""
-    has_prediction, is_correct = _compute_best_pred_correctness(
+    has_prediction, is_correct = _compute_any_pred_correctness(
         raw_logits, labels, temperature, pcut)
 
     n_unique = np.array(metadata_df['n_unique_proteins'], dtype=int)
@@ -1715,7 +1317,7 @@ def make_evaluation_figure(level_results: Dict[str, Dict],
     plot_support_vs_f1(ax_sup, level_results, real_support)
 
     if has_distance:
-        has_prediction, is_correct = _compute_best_pred_correctness(
+        has_prediction, is_correct = _compute_any_pred_correctness(
             logits, labels, temperature, threshold)
         max_ani = np.array(metadata_df['max_pt_train_tani'], dtype=float)
         _plot_distance_bar(
@@ -1771,302 +1373,14 @@ def export_per_class_results(level_results: Dict[str, Dict], out_path: str):
     logger.info(f"Per-class results: {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Figure 5 - Tool comparison
-# ---------------------------------------------------------------------------
-
-RANK_COLORS = {
-    'Phylum': COLORS['primary'],     # blue
-    'Class':  COLORS['tertiary'],    # green
-    'Order':  COLORS['quaternary'],  # orange
-    'Family': COLORS['quinary'],     # purple
-    'Genus':  COLORS['secondary'],   # red
-}
-
-DATASET_LABELS = {
-    'cow_fecal':    'Cow fecal',
-    'human_gut':    'Human gut',
-    'waste_water':  'Waste water',
-    'refseq':       'RefSeq',
-}
-
-
-def _parse_lineage_target(lin: str) -> List[Optional[str]]:
-    """Parse target host_genus_lineage: Domain;Phylum;Class;Order;Family;Genus."""
-    if pd.isna(lin) or lin == '':
-        return [None] * 5
-    parts = lin.split(';')
-    return [parts[i] if i < len(parts) and parts[i] else None
-            for i in range(1, 6)]
-
-
-def _parse_lineage_gtdb(lin: str) -> List[Optional[str]]:
-    """Parse GTDB-style lineage: d__;p__;c__;o__;f__;g__ → strip prefixes."""
-    if pd.isna(lin) or lin == '':
-        return [None] * 5
-    parts = lin.split(';')
-    cleaned = [p.split('__', 1)[1] if '__' in p else p for p in parts]
-    return [cleaned[i] if i < len(cleaned) and cleaned[i] else None
-            for i in range(1, 6)]
-
-
-def _parse_lineage_pt(lin: str) -> List[Optional[str]]:
-    """Parse PT lineage: Phylum;Class;Order;Family;Genus (no domain prefix)."""
-    if pd.isna(lin) or lin == '':
-        return [None] * 5
-    parts = lin.split(';')
-    return [parts[i] if i < len(parts) and parts[i] else None
-            for i in range(0, 5)]
-
-
-def load_comparison_data(compare_dir: str, pt_predictions: pd.DataFrame,
-                         pt_threshold: float
-                         ) -> Tuple[pd.DataFrame, List[str]]:
-    """Load external tool predictions and return a unified stats DataFrame.
-
-    Expects these files in *compare_dir*:
-      - target_lineages.csv          (Phage, dataset, host_genus_lineage)
-      - iphop_predictions_gtdb226.csv
-      - cherry_final_prediction_gtdb.csv
-
-    PhageTransformer predictions are passed directly as *pt_predictions*
-    (DataFrame with columns: sequence_id, genus, score) from live inference.
-
-    Parameters
-    ----------
-    compare_dir : path to the eval_combined directory
-    pt_predictions : DataFrame from predict_test_for_comparison()
-    pt_threshold : PhageTransformer score cutoff (FDR 10% from calibration)
-
-    Returns
-    -------
-    stats : DataFrame with columns dataset, rank, tool, total, has_pred,
-            correct, ratio_correct, ratio_wrong
-    datasets : ordered list of dataset names found
-    """
-    target = pd.read_csv(os.path.join(compare_dir, 'target_lineages.csv'))
-    iphop  = pd.read_csv(os.path.join(compare_dir,
-                                       'iphop_predictions_gtdb226.csv'))
-    cherry = pd.read_csv(os.path.join(compare_dir,
-                                       'cherry_final_prediction_gtdb.csv'))
-
-    # ---- exclusion: remove sequences where iPHoP predicts to genus level ----
-    has_genus = iphop['host_genus_lineage'].str.contains('g__', na=False)
-    excluded_ids = set(iphop.loc[has_genus, 'Virus'])
-    logger.info(f"  Comparison: excluding {len(excluded_ids)} sequences "
-                f"(iPHoP genus-level)")
-
-    # ---- filter & deduplicate each tool ------------------------------------
-    iphop = iphop[~iphop['Virus'].isin(excluded_ids)].copy()
-    iphop = (iphop.sort_values('Confidence score', ascending=False)
-                  .drop_duplicates(subset='Virus', keep='first'))
-
-    pt = pt_predictions[~pt_predictions['sequence_id'].isin(excluded_ids)].copy()
-    pt = (pt.sort_values('score', ascending=False)
-            .drop_duplicates(subset='sequence_id', keep='first'))
-    # Keep sequences that pass the genus score threshold OR are flagged as
-    # bacterial (the model made a confident decision — just not a genus one).
-    has_bact_col = 'is_bacterial' in pt.columns
-    if has_bact_col:
-        pt = pt[(pt['score'] > pt_threshold) | pt['is_bacterial']]
-    else:
-        pt = pt[pt['score'] > pt_threshold]
-    logger.info(f"  PT predictions after FDR threshold ({pt_threshold:.4f}): "
-                f"{len(pt)}"
-                + (f" ({pt['is_bacterial'].sum()} bacterial)"
-                   if has_bact_col else ''))
-
-    cherry = cherry[~cherry['contig_name'].isin(excluded_ids)].copy()
-    cherry = (cherry.sort_values('Score_1', ascending=False)
-                    .drop_duplicates(subset='contig_name', keep='first'))
-
-    target = target[~target['Phage'].isin(excluded_ids)].copy()
-    logger.info(f"  Target sequences after exclusion: {len(target)}")
-
-    # ---- parse lineages into per-rank columns ------------------------------
-    for i, lvl in enumerate(LEVEL_NAMES):
-        target[f'true_{lvl}'] = target['host_genus_lineage'].apply(
-            lambda x, _i=i: _parse_lineage_target(x)[_i])
-        iphop[f'pred_{lvl}'] = iphop['host_genus_lineage'].apply(
-            lambda x, _i=i: _parse_lineage_gtdb(x)[_i])
-        pt[f'pred_{lvl}'] = pt['genus'].apply(
-            lambda x, _i=i: _parse_lineage_pt(x)[_i])
-        cherry[f'pred_{lvl}'] = cherry['Top_1_label_lineage'].apply(
-            lambda x, _i=i: _parse_lineage_gtdb(x)[_i])
-
-    # For bacterial-flagged PT sequences, overwrite lineage predictions with a
-    # sentinel so they count as "has prediction" but never match the target.
-    if has_bact_col:
-        bact_mask = pt['is_bacterial']
-        for lvl in LEVEL_NAMES:
-            pt.loc[bact_mask, f'pred_{lvl}'] = '__bacterial__'
-
-    # ---- merge predictions onto target -------------------------------------
-    true_cols = ['Phage', 'dataset'] + [f'true_{l}' for l in LEVEL_NAMES]
-    pred_cols = lambda col: [col] + [f'pred_{l}' for l in LEVEL_NAMES]
-
-    iphop_m  = target[true_cols].merge(
-        iphop[pred_cols('Virus')],
-        left_on='Phage', right_on='Virus', how='left')
-    # PT merge: include is_bacterial flag
-    pt_merge_cols = pred_cols('sequence_id')
-    if has_bact_col:
-        pt_merge_cols = pt_merge_cols + ['is_bacterial']
-    pt_m     = target[true_cols].merge(
-        pt[pt_merge_cols],
-        left_on='Phage', right_on='sequence_id', how='left')
-    if has_bact_col:
-        pt_m['is_bacterial'] = pt_m['is_bacterial'].fillna(False)
-    cherry_m = target[true_cols].merge(
-        cherry[pred_cols('contig_name')],
-        left_on='Phage', right_on='contig_name', how='left')
-
-    # ---- compute per-dataset, per-rank accuracy ----------------------------
-    datasets = [ds for ds in ['cow_fecal', 'human_gut', 'waste_water', 'refseq']
-                if ds in target['dataset'].values]
-
-    def _stats(merged_df, tool_name):
-        rows = []
-        has_bact = 'is_bacterial' in merged_df.columns
-        for ds in datasets:
-            sub = merged_df[merged_df['dataset'] == ds]
-            total = len(sub)
-            n_bacterial = int(sub['is_bacterial'].sum()) if has_bact else 0
-            for lvl in LEVEL_NAMES:
-                has_pred = int(sub[f'pred_{lvl}'].notna().sum())
-                correct  = int((sub[f'pred_{lvl}'] == sub[f'true_{lvl}']).sum())
-                rows.append({
-                    'dataset': ds, 'rank': lvl, 'tool': tool_name,
-                    'total': total, 'has_pred': has_pred, 'correct': correct,
-                    'ratio_correct': correct / total if total else 0,
-                    'ratio_wrong': (has_pred - correct) / total if total else 0,
-                    'ratio_bacterial': n_bacterial / total if total else 0,
-                })
-        return pd.DataFrame(rows)
-
-    stats = pd.concat([
-        _stats(iphop_m,  'iPHoP'),
-        _stats(pt_m,     'PT'),
-        _stats(cherry_m, 'CHERRY'),
-    ], ignore_index=True)
-
-    return stats, datasets
-
-
-def plot_tool_comparison(axes, stats: pd.DataFrame, datasets: List[str]):
-    """Grouped bar chart comparing tool accuracy across datasets.
-
-    One subplot per dataset, with grouped bars for each tool × taxonomic rank.
-    Solid bars = correct, translucent extensions = incorrect predictions.
-    For PT, a hatched overlay within the wrong portion shows sequences
-    classified as bacterial_fragment.
-    """
-    tools = ['iPHoP', 'PT', 'CHERRY']
-    n_levels = len(LEVEL_NAMES)
-    bar_width = 0.08
-    rank_cols = [RANK_COLORS[r] for r in LEVEL_NAMES]
-    has_bact = 'ratio_bacterial' in stats.columns
-
-    for ax_idx, ds in enumerate(datasets):
-        ax = axes[ax_idx]
-        ds_stats = stats[stats['dataset'] == ds]
-
-        for t_idx, tool in enumerate(tools):
-            ts = ds_stats[ds_stats['tool'] == tool]
-            offsets = np.arange(n_levels) - (n_levels - 1) / 2
-            x_pos = t_idx + offsets * (bar_width + 0.01)
-
-            for j in range(n_levels):
-                c = ts.iloc[j]['ratio_correct']
-                w = ts.iloc[j]['ratio_wrong']
-                ax.bar(x_pos[j], c, width=bar_width, color=rank_cols[j],
-                       edgecolor='white', linewidth=0.5,
-                       label=LEVEL_NAMES[j]
-                             if (t_idx == 0 and ax_idx == 0) else None)
-                ax.bar(x_pos[j], w, bottom=c, width=bar_width,
-                       color=rank_cols[j], edgecolor='white', linewidth=0.5,
-                       alpha=0.35)
-
-                # Bacterial overlay: hatched region at top of wrong bar (PT only)
-                if has_bact and tool == 'PT':
-                    b = ts.iloc[j]['ratio_bacterial']
-                    if b > 0:
-                        ax.bar(x_pos[j], b, bottom=c + w - b,
-                               width=bar_width, facecolor='none',
-                               edgecolor='#333333', linewidth=0.6,
-                               hatch='///', zorder=4)
-
-        ax.set_xticks(range(len(tools)))
-        ax.set_xticklabels(tools, fontsize=FONT_SIZES['tick'],
-                           fontweight='bold')
-        n_seqs = ds_stats['total'].iloc[0]
-        ax.set_title(f'{DATASET_LABELS.get(ds, ds)}\n(n = {n_seqs})',
-                     fontweight='bold', pad=8)
-        ax.set_ylim(0, 1.05)
-        ax.yaxis.set_major_formatter(mpl.ticker.PercentFormatter(xmax=1))
-        ax.yaxis.grid(True, alpha=0.3, linestyle='--')
-        ax.set_axisbelow(True)
-        ax.set_xlim(-0.5, len(tools) - 0.5)
-
-    axes[0].set_ylabel('Fraction of sequences')
-
-
-def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
-                           pt_threshold: float,
-                           out_path: str = 'comparison.png',
-                           dpi: int = 200):
-    """Figure 5: PhageTransformer vs. iPHoP vs. CHERRY across test datasets."""
-    from matplotlib.patches import Patch
-    setup_style()
-
-    stats, datasets = load_comparison_data(compare_dir, pt_predictions,
-                                           pt_threshold)
-    n_ds = len(datasets)
-
-    fig, axes = plt.subplots(1, n_ds, figsize=(4.0 * n_ds, 5.0), sharey=True)
-    if n_ds == 1:
-        axes = [axes]
-
-    plot_tool_comparison(axes, stats, datasets)
-
-    # Legend: rank patches + correct / incorrect / bacterial
-    legend_elements = [Patch(facecolor=RANK_COLORS[r], label=r)
-                       for r in LEVEL_NAMES]
-    legend_elements += [
-        Patch(facecolor='gray', alpha=1.0,  label='Correct'),
-        Patch(facecolor='gray', alpha=0.35, label='Incorrect'),
-        Patch(facecolor='none', edgecolor='#333333', linewidth=0.6,
-              hatch='///', label='Bacterial'),
-    ]
-    fig.legend(handles=legend_elements, loc='upper center',
-               ncol=len(legend_elements), frameon=False,
-               fontsize=FONT_SIZES['legend'],
-               bbox_to_anchor=(0.5, 1.02))
-
-    _suptitle(fig, 'Host prediction accuracy by taxonomic rank', y=1.08)
-    fig.tight_layout()
-
-    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', facecolor='white')
-    logger.info(f"Figure saved: {out_path}")
-
-    pdf_path = os.path.splitext(out_path)[0] + '.pdf'
-    fig.savefig(pdf_path, bbox_inches='tight', facecolor='white')
-    logger.info(f"Figure saved: {pdf_path}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         description='Evaluate PhageTransformer model. '
-                    'Produces figures in <run_dir>/plots/',
+                    'Produces figures in <model_dir>/plots/',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--run_dir', type=str, required=True,
-                        help='Path to training run directory')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Model directory (contains calibration.json and checkpoints/)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--dataset_dir', type=str, default=None,
@@ -2088,11 +1402,6 @@ def main():
     parser.add_argument('--presentation', action='store_true',
                         help='Increase font sizes for presentations and '
                              'remove panel letters')
-    parser.add_argument('--compare_dir', type=str, default=None,
-                        help='Directory with tool comparison CSVs '
-                             '(target_lineages.csv, iPHoP, CHERRY, PT preds)')
-    parser.add_argument('--compare_fdr', type=float, default=0.1,
-                        help='FDR level for PT threshold in comparison figure')
 
     args = parser.parse_args()
 
@@ -2102,21 +1411,16 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
     # ---- presentation mode -----------------------------------------------
-    global PRESENTATION_MODE
     if args.presentation:
-        PRESENTATION_MODE = True
-        _scale = 1.5
-        for key in FONT_SIZES:
-            FONT_SIZES[key] = round(FONT_SIZES[key] * _scale, 1)
-        logger.info("Presentation mode: font sizes scaled by %.1fx, "
-                    "panel letters disabled", _scale)
+        enable_presentation_mode()
+        logger.info("Presentation mode enabled")
 
     # ---- output directory -------------------------------------------------
-    plot_dir = os.path.join(args.run_dir, 'plots')
+    plot_dir = os.path.join(args.model_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
 
     # ---- load model and calibration --------------------------------------
-    model, calib = load_model_and_calibration(args.run_dir, args.checkpoint, device)
+    model, calib = load_model_and_calibration(args.model_dir, args.checkpoint, device)
     temperature = calib['temperature']
     hosts = np.array(calib['hosts'])
     patch_nt_len = calib['model_config']['patch_nt_len']
@@ -2205,7 +1509,7 @@ def main():
         logits, labels, list(hosts), temperature, threshold)
 
     # ---- load training history -------------------------------------------
-    history = load_training_history(args.run_dir)
+    history = load_training_history(args.model_dir)
 
     # ---- compute real class support from full metadata -------------------
     real_support = compute_real_support(
@@ -2258,44 +1562,6 @@ def main():
     export_per_class_results(
         level_results,
         out_path=os.path.join(plot_dir, 'per_class_metrics.tsv'))
-
-    # ---- Figure 5: Tool comparison (optional) ----------------------------
-    if args.compare_dir:
-        logger.info("Generating tool comparison figure ...")
-        # Resolve FDR threshold for PT in comparison
-        cmp_fdr_key = f"fdr_{int(args.compare_fdr * 100):02d}"
-        cmp_fdr_thresholds = calib.get('fdr_thresholds', {})
-        if cmp_fdr_key in cmp_fdr_thresholds:
-            pt_compare_threshold = cmp_fdr_thresholds[cmp_fdr_key]
-            logger.info(f"  PT comparison threshold (FDR {args.compare_fdr*100:.0f}%): "
-                        f"{pt_compare_threshold:.4f}")
-        else:
-            pt_compare_threshold = threshold
-            logger.warning(f"  FDR key '{cmp_fdr_key}' not in calibration, "
-                          f"using main threshold {threshold:.4f}")
-
-        # Load test set with IDs and run live inference
-        logger.info("  Loading external test set for comparison ...")
-        cmp_ids, cmp_seqs, cmp_datasets, cmp_labels = load_test_with_ids(
-            ts_path, hosts)
-        logger.info(f"  External test set: {len(cmp_seqs)} sequences")
-
-        pt_predictions = predict_test_for_comparison(
-            model, cmp_seqs, cmp_ids, hosts, temperature,
-            tokenizer, device,
-            patch_nt_len=patch_nt_len, max_patches=args.max_patches,
-            eval_stride=eval_stride,
-            batch_size=args.batch_size, num_workers=args.num_workers)
-        logger.info(f"  PT predictions: {len(pt_predictions)} sequences, "
-                    f"{(pt_predictions['score'] > pt_compare_threshold).sum()} "
-                    f"above FDR threshold")
-
-        make_comparison_figure(
-            compare_dir=args.compare_dir,
-            pt_predictions=pt_predictions,
-            pt_threshold=pt_compare_threshold,
-            out_path=_output_path(os.path.join(plot_dir, 'comparison.png')),
-            dpi=args.dpi)
 
     logger.info(f"All outputs saved to {plot_dir}/")
     logger.info("Done.")

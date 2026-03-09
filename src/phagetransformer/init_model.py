@@ -16,6 +16,10 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Model registry — update these when releasing new model versions
+# ---------------------------------------------------------------------------
+
 DEFAULT_MODEL_DIR = os.path.join(
     os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
     'phagetransformer', 'default',
@@ -24,13 +28,13 @@ DEFAULT_MODEL_DIR = os.path.join(
 MODEL_FILES = [
     {
         'filename': 'checkpoints/best_aggregator.pt',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
+        'url': 'https://github.com/yourname/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
         'sha256': None,    # fill after upload
         'size_mb': 100,
     },
     {
         'filename': 'calibration.json',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/calibration.json',
+        'url': 'https://github.com/yourname/phagetransformer/releases/download/v0.1.0/calibration.json',
         'sha256': None,
         'size_mb': 0.01,
     },

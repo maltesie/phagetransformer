@@ -194,7 +194,7 @@ class BacterialGenomeStore:
                         f'{t1s}\t{t1e}\t{vs}\t{ve}\t{t2s}\t{t2e}\n')
         logger.info(f"  Bacterial species log: {path} ({len(self.species_list)} species)")
 
-    def sample_subseq(self, split: str, subseq_len: int) -> str:
+    def sample_subseq(self, split: str, subseq_len: int) -> tuple:
         """Sample a random subsequence from the given split ('train' or 'val').
 
         For 'val', samples from the single contiguous val region.
@@ -202,9 +202,13 @@ class BacterialGenomeStore:
         length), then samples a start position within it.  If the chosen
         region is shorter than subseq_len, returns the full region
         (trimmed to a multiple of 3).
+
+        Returns (subsequence, genus) where genus is the first word of
+        the species name (e.g. 'Bacillus' from 'Bacillus subtilis').
         """
         sp = self.species_list[np.random.randint(len(self.species_list))]
         seq = self.genomes[sp]
+        genus = sp.split()[0]
 
         if split == 'val':
             region_start, region_end = self.splits[sp]['val']
@@ -228,12 +232,12 @@ class BacterialGenomeStore:
         else:
             start = region_start + np.random.randint(0, region_len - subseq_len)
             chunk = seq[start:start + subseq_len]
-        return chunk
+        return chunk, genus
 
-    def sample_train_subseq(self, subseq_len: int) -> str:
+    def sample_train_subseq(self, subseq_len: int) -> tuple:
         return self.sample_subseq('train', subseq_len)
 
-    def sample_val_subseq(self, subseq_len: int) -> str:
+    def sample_val_subseq(self, subseq_len: int) -> tuple:
         return self.sample_subseq('val', subseq_len)
 
 
@@ -363,14 +367,17 @@ class BacterialPatchDataset(Dataset):
     """Bacterial patch dataset for encoder-phase training/evaluation.
 
     Each item is a single patch sampled from a random bacterial genome,
-    labeled with a one-hot on the ``bacterial_fragment`` class (last
-    column).  Scrambled samples receive a zero label.
+    labeled with a multi-hot vector: the ``bacterial_fragment`` class
+    (last column) is always set, and the corresponding genus column is
+    set when the genus appears in the host list.  Scrambled samples
+    receive a zero label.
 
     Used alongside :class:`RandomPatchDataset` (via ``ConcatDataset``)
     so the encoder learns to distinguish phage from bacterial DNA.
     """
 
     def __init__(self, genome_store, tokenizer, num_classes: int,
+                 genus_to_idx: dict,
                  n_samples: int, patch_nt_len: int = 3074,
                  is_train: bool = True, scramble_rate: float = 0.0):
         self.genome_store = genome_store
@@ -379,26 +386,35 @@ class BacterialPatchDataset(Dataset):
         self.split = 'train' if is_train else 'val'
         self.n_samples = n_samples
         self.scramble_rate = scramble_rate
-        self.label = np.zeros(num_classes, dtype=np.float32)
-        self.label[-1] = 1.0                 # bacterial_fragment is last class
-        self.zero_label = np.zeros(num_classes, dtype=np.float32)
+        self.num_classes = num_classes
+        self.genus_to_idx = genus_to_idx
+        self.bact_idx = num_classes - 1  # bacterial_fragment is last class
 
     def __len__(self):
         return self.n_samples
 
+    def _make_label(self, genus: str) -> np.ndarray:
+        label = np.zeros(self.num_classes, dtype=np.float32)
+        label[self.bact_idx] = 1.0
+        idx = self.genus_to_idx.get(genus)
+        if idx is not None:
+            label[idx] = 1.0
+        return label
+
     def __getitem__(self, idx):
-        seq = self.genome_store.sample_subseq(self.split, self.patch_nt_len)
+        seq, genus = self.genome_store.sample_subseq(
+            self.split, self.patch_nt_len)
 
         if self.scramble_rate > 0 and np.random.rand() < self.scramble_rate:
             chars = list(seq)
             random.shuffle(chars)
             seq = ''.join(chars)
-            label = self.zero_label
+            label = np.zeros(self.num_classes, dtype=np.float32)
         else:
-            label = self.label
+            label = self._make_label(genus)
 
         tokens = self.tokenizer.tokenize(seq)
-        return tokens, torch.from_numpy(label.copy())
+        return tokens, torch.from_numpy(label)
 
 
 class PatchSequenceDataset(Dataset):
@@ -501,11 +517,13 @@ class BacterialSequenceDataset(Dataset):
 
     Samples random bacterial subsequences with lengths drawn from the
     phage genome length distribution, tiles them into patches, and
-    assigns a label with only the bacterial_fragment column set.
+    assigns a multi-hot label: the ``bacterial_fragment`` column plus
+    the genus column when the genus appears in the host list.
     """
 
     def __init__(self, genome_store, tokenizer, phage_lengths,
-                 n_samples, agg_num_classes, patch_nt_len=3072,
+                 n_samples, agg_num_classes, genus_to_idx: dict,
+                 patch_nt_len=3072,
                  max_patches=512, coverage=2.0, is_train=True,
                  eval_stride=None):
         self.genome_store = genome_store
@@ -518,11 +536,20 @@ class BacterialSequenceDataset(Dataset):
         self.split = 'train' if is_train else 'val'
         self.train_stride = max(1, int(patch_nt_len / coverage))
         self.eval_stride = eval_stride or patch_nt_len // 2
-        self.label = np.zeros(agg_num_classes, dtype=np.float32)
-        self.label[-1] = 1.0
+        self.num_classes = agg_num_classes
+        self.genus_to_idx = genus_to_idx
+        self.bact_idx = agg_num_classes - 1
 
     def __len__(self):
         return self.n_samples
+
+    def _make_label(self, genus: str) -> np.ndarray:
+        label = np.zeros(self.num_classes, dtype=np.float32)
+        label[self.bact_idx] = 1.0
+        idx = self.genus_to_idx.get(genus)
+        if idx is not None:
+            label[idx] = 1.0
+        return label
 
     def _tile(self, seq, stride):
         plen = self.patch_nt_len
@@ -542,18 +569,20 @@ class BacterialSequenceDataset(Dataset):
     def __getitem__(self, idx):
         target_len = self.phage_lengths[
             np.random.randint(len(self.phage_lengths))]
-        seq = self.genome_store.sample_subseq(
+        seq, genus = self.genome_store.sample_subseq(
             self.split, target_len)
 
         stride = self.train_stride if self.is_train else self.eval_stride
         patches = self._tile(seq, stride)
+
+        label = self._make_label(genus)
 
         toks = [self.tokenizer.tokenize(p) for p in patches]
         max_cl = max(t.size(1) for t in toks)
         padded = torch.zeros(len(toks), 6, max_cl, dtype=torch.long)
         for i, t in enumerate(toks):
             padded[i, :, :t.size(1)] = t
-        return padded, len(toks), torch.from_numpy(self.label.copy())
+        return padded, len(toks), torch.from_numpy(label)
 
 
 def sequence_collate_fn(batch):

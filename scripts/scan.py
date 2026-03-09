@@ -26,8 +26,8 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .model import CodonTokenizer
-from .predict import (
+from phagetransformer.model import CodonTokenizer
+from phagetransformer.predict import (
     read_fasta,
     load_model_and_calibration,
     tile_sequence,

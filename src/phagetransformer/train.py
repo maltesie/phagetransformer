@@ -156,12 +156,40 @@ def evaluate(model, loader, criterion, device, threshold, tag, unpack_fn,
     if n_extra_classes > 0:
         core_logits = all_logits[:, :-n_extra_classes]
         core_labels = all_labels[:, :-n_extra_classes]
-        m = compute_metrics(core_logits, core_labels, threshold)
 
+        # Split samples: bacterial_fragment is the last column
+        bact_flag = all_labels[:, -1].bool()
+        phage_mask = ~bact_flag
+        bact_mask = bact_flag
+
+        # Phage-only genus metrics (drives checkpoint selection)
+        n_phage = phage_mask.sum().item()
+        if n_phage > 0:
+            m = compute_metrics(core_logits[phage_mask],
+                                core_labels[phage_mask], threshold)
+        else:
+            m = compute_metrics(core_logits, core_labels, threshold)
+        logger.info(f"  [{tag}:phage] n={n_phage}  "
+                    f"micro-F1={m['micro_f1']:.4f}  "
+                    f"macro-F1={m['macro_f1']:.4f}  "
+                    f"micro-P={m['micro_p']:.4f}  "
+                    f"micro-R={m['micro_r']:.4f}")
+
+        # Bacterial genus metrics (informational)
+        n_bact = bact_mask.sum().item()
+        if n_bact > 0:
+            m_bact_genus = compute_metrics(core_logits[bact_mask],
+                                           core_labels[bact_mask], threshold)
+            logger.info(f"  [{tag}:bact_genus] n={n_bact}  "
+                        f"micro-F1={m_bact_genus['micro_f1']:.4f}  "
+                        f"micro-P={m_bact_genus['micro_p']:.4f}  "
+                        f"micro-R={m_bact_genus['micro_r']:.4f}")
+
+        # Bacterial fragment detection (binary, all samples)
         extra_logits = all_logits[:, -n_extra_classes:]
         extra_labels = all_labels[:, -n_extra_classes:]
         m_extra = compute_metrics(extra_logits, extra_labels, threshold)
-        logger.info(f"  [{tag}:bacterial] "
+        logger.info(f"  [{tag}:bact_detect]  "
                     f"micro-F1={m_extra['micro_f1']:.4f}  "
                     f"micro-P={m_extra['micro_p']:.4f}  "
                     f"micro-R={m_extra['micro_r']:.4f}")
@@ -502,6 +530,18 @@ def main():
     n_extra_classes = 1 if use_bacteria else 0
     agg_num_classes = num_classes + n_extra_classes
 
+    # Build genus → label index mapping for bacterial genome labeling
+    genus_to_idx = {}
+    if use_bacteria:
+        for i, h in enumerate(hosts):
+            genus = h.split(';')[-1] if ';' in h else h
+            genus_to_idx[genus] = i
+        n_matched = sum(1 for sp in genome_store.species_list
+                        if sp.split()[0] in genus_to_idx)
+        logger.info(f"  Genus mapping: {len(genus_to_idx)} host genera, "
+                    f"{n_matched}/{len(genome_store.species_list)} bacterial "
+                    f"species have a matching host genus")
+
     # ---- model config dict (saved with calibration) ----------------------
     model_config = dict(
         num_classes=agg_num_classes, cnn_embed_dim=args.cnn_embed_dim,
@@ -647,6 +687,7 @@ def main():
                                      * args.encoder_bacteria_ratio))
         bact_train_patch_ds = BacterialPatchDataset(
             genome_store, tokenizer, num_classes=agg_num_classes,
+            genus_to_idx=genus_to_idx,
             n_samples=n_bact_patches,
             patch_nt_len=args.patch_nt_len, is_train=True,
             scramble_rate=args.encoder_scramble_rate,
@@ -678,6 +719,7 @@ def main():
                                      * args.encoder_bacteria_ratio))
             bact_val_patch_ds = BacterialPatchDataset(
                 genome_store, tokenizer, num_classes=agg_num_classes,
+                genus_to_idx=genus_to_idx,
                 n_samples=n_bact_val,
                 patch_nt_len=args.patch_nt_len, is_train=False,
             )
@@ -768,6 +810,7 @@ def main():
             genome_store, tokenizer, phage_lengths,
             n_samples=n_bacteria_train,
             agg_num_classes=agg_num_classes,
+            genus_to_idx=genus_to_idx,
             patch_nt_len=args.patch_nt_len,
             max_patches=args.max_patches,
             coverage=args.train_coverage, is_train=True,
@@ -795,6 +838,7 @@ def main():
                 genome_store, tokenizer, phage_lengths,
                 n_samples=n_bacteria_val,
                 agg_num_classes=agg_num_classes,
+                genus_to_idx=genus_to_idx,
                 patch_nt_len=args.patch_nt_len,
                 max_patches=args.max_patches, is_train=False,
                 eval_stride=args.eval_stride,
@@ -818,6 +862,7 @@ def main():
             genome_store, tokenizer, phage_lengths,
             n_samples=n_bacteria_test,
             agg_num_classes=agg_num_classes,
+            genus_to_idx=genus_to_idx,
             patch_nt_len=args.patch_nt_len,
             max_patches=args.max_patches, is_train=False,
             eval_stride=args.eval_stride,
