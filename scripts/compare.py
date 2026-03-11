@@ -159,28 +159,46 @@ def load_comparison_data(compare_dir: str, pt_predictions: pd.DataFrame,
 
 
 def load_quality_data(compare_dir: str):
-    """Load geNomad and CheckV results.
+    """Load geNomad, CheckV, and plasmid results.
 
-    Returns (genomad_viral_ids, checkv_nonviral_ids) where both are sets
-    of contig IDs (provirus suffixes stripped for geNomad).
+    Returns (genomad_viral_or_plasmid_ids, checkv_nonviral_ids) where:
+    - genomad_viral_or_plasmid_ids includes both viral and plasmid contigs
+      (so that plasmids are excluded from the non-viral set)
+    - checkv_nonviral_ids are contigs with viral_genes/host_genes < 0.1
+      (only when host_genes > 0)
     """
     genomad_path = os.path.join(compare_dir, 'hic_combined_virus_summary.tsv')
     checkv_path = os.path.join(compare_dir, 'quality_summary.tsv')
+    plasmid_path = os.path.join(compare_dir, 'hic_combined_plasmid_summary.tsv')
 
-    # geNomad: sequences in this file are viral
+    # geNomad: sequences in virus file are viral
     genomad = pd.read_csv(genomad_path, sep='\t')
-    genomad_ids = set(genomad['seq_name'].str.replace(
+    genomad_viral = set(genomad['seq_name'].str.replace(
         r'\|provirus_.*', '', regex=True))
-    logger.info(f"  geNomad: {len(genomad_ids)} viral contigs")
+    logger.info(f"  geNomad: {len(genomad_viral)} viral contigs")
 
-    # CheckV: 0 viral genes → non-viral
+    # Plasmids: exclude from non-viral classification
+    plasmid_ids = set()
+    if os.path.exists(plasmid_path):
+        plasmids = pd.read_csv(plasmid_path, sep='\t')
+        plasmid_ids = set(plasmids['seq_name'])
+        logger.info(f"  geNomad: {len(plasmid_ids)} plasmid contigs (excluded "
+                    f"from non-viral)")
+    else:
+        logger.info(f"  No plasmid file found, skipping plasmid exclusion")
+
+    # Combine viral + plasmid → not-non-viral
+    genomad_not_nonviral = genomad_viral | plasmid_ids
+
+    # CheckV: viral_genes / host_genes < 0.1 (with host_genes > 0) → non-viral
     checkv = pd.read_csv(checkv_path, sep='\t')
-    checkv_nonviral = set(
-        checkv.loc[checkv['viral_genes'] == 0, 'contig_id'])
-    logger.info(f"  CheckV: {len(checkv_nonviral)} contigs with 0 viral genes "
-                f"(of {len(checkv)} total)")
+    has_host = checkv['host_genes'] > 0
+    low_ratio = (checkv['viral_genes'] / checkv['host_genes']) < 0.1
+    checkv_nonviral = set(checkv.loc[has_host & low_ratio, 'contig_id'])
+    logger.info(f"  CheckV: {len(checkv_nonviral)} contigs with "
+                f"viral/host gene ratio < 0.1 (of {len(checkv)} total)")
 
-    return genomad_ids, checkv_nonviral
+    return genomad_not_nonviral, checkv_nonviral
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +229,26 @@ def compute_stats(iphop_m, pt_m, cherry_m, datasets):
                     'ratio_wrong': (has_pred - correct) / total if total else 0,
                 })
     return pd.DataFrame(rows)
+
+
+def log_stats(stats: pd.DataFrame, label: str):
+    """Log prediction ratio and precision for each dataset × tool × rank."""
+    logger.info(f"  --- {label} ---")
+    for ds in stats['dataset'].unique():
+        ds_stats = stats[stats['dataset'] == ds]
+        total = ds_stats['total'].iloc[0]
+        logger.info(f"  {DATASET_LABELS.get(ds, ds)} (n={total}):")
+        for tool in ['iPHoP', 'PT', 'CHERRY']:
+            ts = ds_stats[ds_stats['tool'] == tool]
+            parts = []
+            for _, row in ts.iterrows():
+                pred_ratio = row['has_pred'] / row['total'] if row['total'] else 0
+                precision = row['correct'] / row['has_pred'] if row['has_pred'] else 0
+                parts.append(f"{row['rank']}: "
+                             f"pred={pred_ratio:.1%} "
+                             f"prec={precision:.1%} "
+                             f"({row['correct']}/{row['has_pred']}/{row['total']})")
+            logger.info(f"    {tool:8s}  " + "  ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +371,7 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
 
     # Compute stats for all datasets (unfiltered)
     stats_all = compute_stats(iphop_m, pt_m, cherry_m, datasets)
+    log_stats(stats_all, 'Unfiltered')
 
     # Load quality data
     genomad_viral_ids, checkv_nonviral_ids = load_quality_data(compare_dir)
@@ -368,6 +407,7 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
                            ~cherry_m['dataset'].isin(hic_ds)]
 
     stats_filt = compute_stats(iphop_filt, pt_filt, cherry_filt, hic_ds)
+    log_stats(stats_filt, 'Filtered (excl. consensus non-viral)')
 
     # ---- Figure layout ----
     # Top row: [A: RefSeq] [B: 3× HiC]

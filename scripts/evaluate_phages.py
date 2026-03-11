@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Evaluate a trained PhageTransformer model and produce figures.
+"""Evaluate a trained PhageTransformer model on phage host prediction.
 
 Standalone script — not part of the installed package.
 
 Usage:
-    python evaluate.py --model_dir ./models/my_training_run
+    python evaluate_phages.py --model_dir ./models/my_training_run
 """
 
 import argparse
@@ -33,6 +33,7 @@ from eval_utils import (
     setup_style, _add_panel_letters, _output_path, _suptitle,
     enable_presentation_mode,
     collect_logits, evaluate_all_levels, compute_real_support,
+    parse_lineages, aggregate_to_level,
 )
 
 logger = logging.getLogger(__name__)
@@ -1379,6 +1380,190 @@ def export_per_class_results(level_results: Dict[str, Dict], out_path: str):
     logger.info(f"Per-class results: {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# Figure — Precision-Recall curves
+# ---------------------------------------------------------------------------
+
+RANK_COLORS = {
+    'Phylum': COLORS['primary'],
+    'Class':  COLORS['tertiary'],
+    'Order':  COLORS['quaternary'],
+    'Family': COLORS['quinary'],
+    'Genus':  COLORS['secondary'],
+}
+
+
+def _compute_pr_curve(probs, labels, n_thresholds=200):
+    """Compute micro- and macro-averaged PR curves by threshold sweep.
+
+    Returns (thresholds, micro_p, micro_r, macro_p, macro_r) arrays.
+    """
+    thresholds = np.linspace(0, 1, n_thresholds)
+    micro_p = np.zeros(n_thresholds)
+    micro_r = np.zeros(n_thresholds)
+    macro_p = np.zeros(n_thresholds)
+    macro_r = np.zeros(n_thresholds)
+
+    # Support mask: classes with at least one positive
+    support = labels.sum(0)
+    has_support = support > 0
+
+    for ti, t in enumerate(thresholds):
+        preds = (probs >= t).float()
+        tp = (preds * labels).sum(0)
+        fp = (preds * (1 - labels)).sum(0)
+        fn = ((1 - preds) * labels).sum(0)
+
+        # Micro
+        tp_sum = tp.sum().item()
+        fp_sum = fp.sum().item()
+        fn_sum = fn.sum().item()
+        micro_p[ti] = tp_sum / max(tp_sum + fp_sum, 1e-12)
+        micro_r[ti] = tp_sum / max(tp_sum + fn_sum, 1e-12)
+
+        # Macro (only classes with support)
+        per_p = tp / (tp + fp).clamp(min=1e-12)
+        per_r = tp / (tp + fn).clamp(min=1e-12)
+        # Set precision to 1 when no predictions (tp+fp=0) and no positives
+        no_pred = (tp + fp) == 0
+        per_p[no_pred & ~has_support] = 0
+        per_p[no_pred & has_support] = 1.0  # conservative: if we predict nothing, precision=1
+
+        if has_support.any():
+            macro_p[ti] = per_p[has_support].mean().item()
+            macro_r[ti] = per_r[has_support].mean().item()
+
+    return thresholds, micro_p, micro_r, macro_p, macro_r
+
+
+def _compute_auprc(precision, recall):
+    """Compute area under the PR curve (trapezoidal)."""
+    # Sort by recall ascending
+    order = np.argsort(recall)
+    r_sorted = recall[order]
+    p_sorted = precision[order]
+    return np.trapz(p_sorted, r_sorted)
+
+
+def _plot_pr_panel(ax, probs_per_level, labels_per_level, level_names,
+                   title, temperature, averaging='micro', n_thresholds=200):
+    """Plot PR curves for all taxonomic levels on one axis."""
+    for level_name in level_names:
+        if level_name not in probs_per_level:
+            continue
+        probs = probs_per_level[level_name]
+        labels = labels_per_level[level_name]
+        _, micro_p, micro_r, macro_p, macro_r = _compute_pr_curve(
+            probs, labels, n_thresholds)
+
+        if averaging == 'micro':
+            p, r = micro_p, micro_r
+        else:
+            p, r = macro_p, macro_r
+
+        auprc = _compute_auprc(p, r)
+        color = RANK_COLORS.get(level_name, '#999')
+        ax.plot(r, p, color=color, linewidth=1.5, alpha=0.85,
+                label=f'{level_name} (AUPRC={auprc:.3f})')
+
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.02)
+    ax.set_title(title, fontweight='bold', pad=8)
+    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower left',
+              frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.set_aspect('equal')
+
+
+def make_pr_figure(logits: torch.Tensor, labels: torch.Tensor,
+                   hosts: List[str], temperature: float,
+                   blocked_classes: Optional[List[int]] = None,
+                   out_path: str = 'precision_recall.png',
+                   dpi: int = 200):
+    """Precision-recall curves at each taxonomic level.
+
+    Three panels:
+      A: Micro-averaged PR curves per rank
+      B: Macro-averaged PR curves per rank (all classes)
+      C: Macro-averaged PR curves per rank (blocked classes excluded)
+    """
+    setup_style()
+
+    probs = torch.sigmoid(logits / temperature)
+    max_depth, lineages = parse_lineages(hosts)
+
+    # Aggregate to each level
+    probs_per_level = {}
+    labels_per_level = {}
+    level_names_present = []
+    for level in range(max_depth):
+        name = LEVEL_NAMES[level] if level < len(LEVEL_NAMES) else f'Level_{level}'
+        if level == max_depth - 1:
+            probs_per_level[name] = probs
+            labels_per_level[name] = labels
+        else:
+            agg_p, agg_l, _ = aggregate_to_level(probs, labels, lineages, level)
+            probs_per_level[name] = agg_p
+            labels_per_level[name] = agg_l
+        level_names_present.append(name)
+
+    # Blocked-class version: zero out blocked columns at genus level
+    has_blocked = blocked_classes and len(blocked_classes) > 0
+    probs_blocked = {}
+    labels_blocked = {}
+    if has_blocked:
+        keep_mask = torch.ones(probs.shape[1], dtype=torch.bool)
+        keep_mask[blocked_classes] = False
+        probs_kept = probs[:, keep_mask]
+        labels_kept = labels[:, keep_mask]
+        hosts_kept = [h for i, h in enumerate(hosts) if keep_mask[i]]
+
+        _, lineages_kept = parse_lineages(hosts_kept)
+        max_depth_kept = max(len(lin) for lin in lineages_kept)
+
+        for level in range(max_depth_kept):
+            name = LEVEL_NAMES[level] if level < len(LEVEL_NAMES) else f'Level_{level}'
+            if level == max_depth_kept - 1:
+                probs_blocked[name] = probs_kept
+                labels_blocked[name] = labels_kept
+            else:
+                agg_p, agg_l, _ = aggregate_to_level(
+                    probs_kept, labels_kept, lineages_kept, level)
+                probs_blocked[name] = agg_p
+                labels_blocked[name] = agg_l
+
+    # --- Figure: 1×3 ---
+    n_panels = 3 if has_blocked else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.5 * n_panels, 6),
+                             squeeze=False)
+    axes = axes[0]
+
+    _plot_pr_panel(axes[0], probs_per_level, labels_per_level,
+                   level_names_present, 'Micro-averaged precision–recall',
+                   temperature, averaging='micro')
+
+    _plot_pr_panel(axes[1], probs_per_level, labels_per_level,
+                   level_names_present, 'Macro-averaged precision–recall',
+                   temperature, averaging='macro')
+
+    if has_blocked:
+        n_blocked = len(blocked_classes)
+        n_kept = int(keep_mask.sum())
+        _plot_pr_panel(axes[2], probs_blocked, labels_blocked,
+                       level_names_present,
+                       f'Macro-averaged PR\n({n_blocked} blocked classes removed, '
+                       f'{n_kept} kept)',
+                       temperature, averaging='macro')
+
+    letters = 'ABC'[:n_panels]
+    _add_panel_letters(axes, letters, x=-0.08, y=1.06)
+
+    fig.tight_layout()
+    _save_figure(fig, out_path, dpi=dpi)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Evaluate PhageTransformer model. '
@@ -1430,6 +1615,7 @@ def main():
     temperature = calib['temperature']
     hosts = np.array(calib['hosts'])
     patch_nt_len = calib['model_config']['patch_nt_len']
+    blocked_classes = calib.get('blocked_classes', [])
 
     # Determine threshold
     if args.fdr is not None:
@@ -1568,6 +1754,14 @@ def main():
     export_per_class_results(
         level_results,
         out_path=os.path.join(plot_dir, 'per_class_metrics.tsv'))
+
+    # ---- Figure 5: Precision–Recall curves --------------------------------
+    logger.info("Generating precision–recall figure ...")
+    make_pr_figure(
+        logits, labels, list(hosts), temperature,
+        blocked_classes=blocked_classes,
+        out_path=_output_path(os.path.join(plot_dir, 'precision_recall.png')),
+        dpi=args.dpi)
 
     logger.info(f"All outputs saved to {plot_dir}/")
     logger.info("Done.")
