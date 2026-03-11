@@ -194,6 +194,29 @@ class BacterialGenomeStore:
                         f'{t1s}\t{t1e}\t{vs}\t{ve}\t{t2s}\t{t2e}\n')
         logger.info(f"  Bacterial species log: {path} ({len(self.species_list)} species)")
 
+    def load_splits(self, path: str):
+        """Override per-genome train/val splits from a previously saved TSV.
+
+        This ensures evaluation uses the exact same splits as training.
+        Species in the TSV that are not loaded are silently skipped;
+        loaded species not in the TSV keep their random splits.
+        """
+        import pandas as _pd
+        df = _pd.read_csv(path, sep='\t')
+        n_applied = 0
+        for _, row in df.iterrows():
+            sp = row['species']
+            if sp not in self.genomes:
+                continue
+            self.splits[sp] = {
+                'val': (int(row['val_start']), int(row['val_end'])),
+                'train': [(int(row['train1_start']), int(row['train1_end'])),
+                          (int(row['train2_start']), int(row['train2_end']))],
+            }
+            n_applied += 1
+        logger.info(f"  Loaded splits from {path}: {n_applied} species "
+                    f"(of {len(df)} in file, {len(self.species_list)} loaded)")
+
     def sample_subseq(self, split: str, subseq_len: int) -> tuple:
         """Sample a random subsequence from the given split ('train' or 'val').
 

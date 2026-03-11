@@ -676,6 +676,14 @@ def main():
     logger.info("Loading bacterial genomes ...")
     genome_store = BacterialGenomeStore(args.host_genome_dir)
 
+    # Load train/val splits from training run
+    splits_path = os.path.join(args.model_dir, 'logs', 'bacterial_species.tsv')
+    if os.path.exists(splits_path):
+        genome_store.load_splits(splits_path)
+    else:
+        logger.warning(f"  {splits_path} not found — using default random "
+                       f"splits (may not match training)")
+
     # ---- bacterial inference ---------------------------------------------
     tokenizer = CodonTokenizer()
     eval_stride = args.eval_stride or patch_nt_len // 2
