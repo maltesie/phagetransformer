@@ -511,6 +511,11 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
 
     fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
     logger.info(f"Annotation plot saved: {out_path}")
+    root = os.path.splitext(out_path)[0]
+    for ext in ('.pdf', '.svg'):
+        path = root + ext
+        fig.savefig(path, bbox_inches='tight')
+        logger.info(f"Figure saved: {path}")
     plt.close(fig)
 
 

@@ -215,7 +215,7 @@ def predict_test_for_comparison(
     """
     dummy_labels = np.zeros((len(seqs), len(hosts)), dtype=np.float32)
 
-    stride = eval_stride or patch_nt_len // 2
+    stride = (eval_stride or int(patch_nt_len * 2/3)) // 3 * 3
     ds = PatchSequenceDataset(
         seqs, dummy_labels, tokenizer,
         patch_nt_len=patch_nt_len, max_patches=max_patches,
@@ -230,8 +230,8 @@ def predict_test_for_comparison(
     logits, _ = collect_logits(model, loader, device)
     all_probs = torch.sigmoid(logits / temperature)
 
-    n_core = len(hosts)
-    has_bact_class = all_probs.shape[1] > n_core
+    has_bact_class = hosts[-1] == 'bacterial_fragment'
+    n_core = len(hosts) - 1 if has_bact_class else len(hosts)
 
     core_probs = all_probs[:, :n_core]
 
@@ -240,7 +240,7 @@ def predict_test_for_comparison(
         is_bact = False
         if has_bact_class:
             bact_prob = all_probs[i, n_core].item()
-            is_bact = bact_prob >= threshold and bact_prob > core_probs[i].max().item()
+            is_bact = bact_prob >= 0.5
 
         above = (core_probs[i] >= threshold).nonzero(as_tuple=True)[0]
         if len(above) > 0:

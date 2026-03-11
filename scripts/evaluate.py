@@ -10,7 +10,8 @@ Usage:
 import argparse
 import logging
 import os
-from typing import Dict, List, Optional
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -35,6 +36,18 @@ from eval_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _save_figure(fig, out_path: str, dpi: int = 200):
+    """Save figure as PNG, PDF, and SVG."""
+    fig.savefig(out_path, dpi=dpi)
+    logger.info(f"Figure saved: {out_path}")
+    root = os.path.splitext(out_path)[0]
+    for ext in ('.pdf', '.svg'):
+        path = root + ext
+        fig.savefig(path, bbox_inches='tight', facecolor='white')
+        logger.info(f"Figure saved: {path}")
+    plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Training history
@@ -527,8 +540,9 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     pc_best = centered @ Vt[:best_k].T
     sil, sil_p = silhouette_with_pvalue(pc_best, aa_label_arr)
 
-    # Wobble (3rd position) classification: pyrimidine (U/C) vs purine (A/G)
-    wobble_is_purine = np.array([c[2] in 'AG' for c in codons])  # True=purine
+    # Purine fraction per codon: fraction of A/G nucleotides (0, 1/3, 2/3, 1)
+    purine_fraction = np.array([sum(1 for nt in c if nt in 'AG') / 3.0
+                                for c in codons])
 
     # Shared plotting helpers
     def _plot_aa(ax, coords):
@@ -544,25 +558,19 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
 
-    def _plot_wobble(ax, coords):
-        """Plot codons colored by wobble position: UC (pyrimidine) vs AG (purine)."""
-        color_pur = COLORS['primary']    # AG — purine
-        color_pyr = COLORS['secondary']  # UC — pyrimidine
-        mask_pur = wobble_is_purine
-        mask_pyr = ~wobble_is_purine
-        ax.scatter(coords[mask_pyr, 0], coords[mask_pyr, 1],
-                   c=color_pyr, s=50, alpha=0.85,
-                   edgecolors='white', linewidths=0.4, zorder=3,
-                   label='UC (pyrimidine)')
-        ax.scatter(coords[mask_pur, 0], coords[mask_pur, 1],
-                   c=color_pur, s=50, alpha=0.85,
-                   edgecolors='white', linewidths=0.4, zorder=3,
-                   label='AG (purine)')
+    def _plot_purine(ax, coords):
+        """Plot codons colored by purine fraction (continuous)."""
+        sc = ax.scatter(coords[:, 0], coords[:, 1],
+                        c=purine_fraction, cmap='RdYlBu_r',
+                        vmin=0, vmax=1,
+                        s=50, alpha=0.85,
+                        edgecolors='white', linewidths=0.4, zorder=3)
         for i, codon in enumerate(codons):
             ax.annotate(codon, (coords[i, 0], coords[i, 1]),
                         fontsize=FONT_SIZES['codon'], ha='center', va='bottom',
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
+        return sc
 
     # ---- Compute property–PC correlations for summary panel ----
     from scipy.stats import spearmanr as _spearmanr
@@ -571,7 +579,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     all_var = S ** 2 / (S ** 2).sum()
     pcs_all = centered @ Vt[:n_summary_pcs].T
 
-    prop_matrix, prop_names = build_codon_property_matrix(codons)
+    prop_matrix, prop_names = get_curated_properties(codons)
     n_props = len(prop_names)
 
     # For each PC find the most-correlated property
@@ -590,28 +598,6 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
         best_rho.append(top_r)
         best_pval.append(top_p)
 
-    # Property group colors for the summary bars
-    _prop_group_colors = {
-        'Nucleotide': '#4E79A7', 'Dinucleotide': '#F28E2B',
-        'Sequence': '#76B7B2', 'Amino acid': '#E15759',
-        'Degeneracy': '#59A14F', 'Other': '#999999',
-    }
-
-    def _prop_group(name):
-        if name.startswith('pos') or name.startswith('GC_pos') \
-                or name.startswith('purine_pos'):
-            return 'Nucleotide'
-        if name.startswith('dinuc_'):
-            return 'Dinucleotide'
-        if name.startswith('wobble') or name in ('GC_content', 'total_hbonds',
-                                                  'purine_purine_steps'):
-            return 'Sequence'
-        if name.startswith('aa_') or name in ('is_stop', 'is_start'):
-            return 'Amino acid'
-        if 'degenerate' in name or name == 'degeneracy':
-            return 'Degeneracy'
-        return 'Other'
-
     # --- Layout: 1×3 (or 2×3 with MDS) ---
     nrows = 2 if show_mds else 1
     fig = plt.figure(figsize=(22, 6.5 * nrows))
@@ -622,7 +608,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     # --- Panel A: summary bar chart ---
     ax_summary = fig.add_subplot(gs[0, 0])
     y_pos = np.arange(n_summary_pcs)
-    bar_colors = [_prop_group_colors.get(_prop_group(prop_names[idx]), '#999')
+    bar_colors = [PROPERTY_GROUP_COLORS.get(prop_group(prop_names[idx]), '#999')
                   for idx in best_prop_idx]
     bars = ax_summary.barh(y_pos, [abs(r) for r in best_rho],
                            color=bar_colors, edgecolor='white',
@@ -649,9 +635,9 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
 
     # Mini legend for property groups (only groups actually present)
     from matplotlib.patches import Patch as _Patch
-    seen_groups = sorted(set(_prop_group(prop_names[idx])
+    seen_groups = sorted(set(prop_group(prop_names[idx])
                              for idx in best_prop_idx))
-    grp_patches = [_Patch(facecolor=_prop_group_colors[g], label=g)
+    grp_patches = [_Patch(facecolor=PROPERTY_GROUP_COLORS.get(g, '#999'), label=g)
                    for g in seen_groups]
     ax_summary.legend(handles=grp_patches,
                       fontsize=FONT_SIZES['bar_label'], loc='lower right',
@@ -670,16 +656,16 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                    fontsize=FONT_SIZES['annotation'], color=COLORS['text'],
                    va='top', ha='right')
 
-    # --- Panel C: PCA — wobble ---
-    ax_pca_wob = fig.add_subplot(gs[0, 2])
-    _plot_wobble(ax_pca_wob, pc)
-    ax_pca_wob.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
-    ax_pca_wob.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
-    ax_pca_wob.set_title('PCA — wobble nucleotide (3rd pos.)')
-    ax_pca_wob.legend(fontsize=FONT_SIZES['legend_small'], loc='best',
-                      frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
+    # --- Panel C: PCA — purine fraction ---
+    ax_pca_pur = fig.add_subplot(gs[0, 2])
+    sc = _plot_purine(ax_pca_pur, pc)
+    ax_pca_pur.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
+    ax_pca_pur.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
+    ax_pca_pur.set_title('PCA — purine fraction')
+    cbar = fig.colorbar(sc, ax=ax_pca_pur, shrink=0.7, pad=0.02)
+    cbar.set_label('Purine fraction', fontsize=FONT_SIZES['colorbar'])
 
-    all_axes = [ax_summary, ax_pca_aa, ax_pca_wob]
+    all_axes = [ax_summary, ax_pca_aa, ax_pca_pur]
 
     # Row 1: MDS (cosine) — optional
     if show_mds:
@@ -696,16 +682,15 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                        fontsize=FONT_SIZES['annotation'],
                        color=COLORS['text'], va='top')
 
-        ax_mds_wob = fig.add_subplot(gs[1, 2])
-        _plot_wobble(ax_mds_wob, mds)
-        ax_mds_wob.set_xlabel('MDS dim 1')
-        ax_mds_wob.set_ylabel('MDS dim 2')
-        ax_mds_wob.set_title('MDS (cosine) — wobble nucleotide')
-        ax_mds_wob.legend(fontsize=FONT_SIZES['legend_small'], loc='best',
-                          frameon=True, framealpha=0.9,
-                          edgecolor=COLORS['grid'])
+        ax_mds_pur = fig.add_subplot(gs[1, 2])
+        sc_mds = _plot_purine(ax_mds_pur, mds)
+        ax_mds_pur.set_xlabel('MDS dim 1')
+        ax_mds_pur.set_ylabel('MDS dim 2')
+        ax_mds_pur.set_title('MDS (cosine) — purine fraction')
+        fig.colorbar(sc_mds, ax=ax_mds_pur, shrink=0.7, pad=0.02).set_label(
+            'Purine fraction', fontsize=FONT_SIZES['colorbar'])
 
-        all_axes += [ax_mds_aa, ax_mds_wob]
+        all_axes += [ax_mds_aa, ax_mds_pur]
 
     # Panel labels
     _add_panel_letters(all_axes, 'ABCDE', x=-0.06, y=1.06)
@@ -714,7 +699,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     handles, labels = ax_pca_aa.get_legend_handles_labels()
     fig.legend(handles, labels, fontsize=FONT_SIZES['legend_small'], ncol=1,
                loc='center left',
-               bbox_to_anchor=(0.62, 0.5 if not show_mds else 0.75),
+               bbox_to_anchor=(0.67, 0.5 if not show_mds else 0.75),
                frameon=True, framealpha=0.9, edgecolor=COLORS['grid'],
                handletextpad=0.4)
 
@@ -726,9 +711,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     title += ')'
     _suptitle(fig, title, y=0.97)
 
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +767,51 @@ _AA_DEGENERACY = {
     'Stop': 3,
 }
 
+# Curated property whitelist — used consistently across all figures
+CURATED_PROPERTIES = [
+    # Sequence composition
+    'GC_content', 'purine_fraction',
+    'GC_pos1', 'GC_pos2', 'GC_pos3',
+    'purine_pos1', 'purine_pos2', 'purine_pos3',
+    # Amino acid physicochemistry
+    'aa_hydrophobicity', 'aa_charge_pH7',
+    # Amino acid categories
+    'aa_aromatic', 'aa_aliphatic', 'aa_sulfur',
+    # Coding
+    'degeneracy', 'is_stop',
+]
+
+PROPERTY_GROUPS = {
+    'GC_content': 'Sequence', 'purine_fraction': 'Sequence',
+    'GC_pos1': 'Sequence', 'GC_pos2': 'Sequence', 'GC_pos3': 'Sequence',
+    'purine_pos1': 'Sequence', 'purine_pos2': 'Sequence',
+    'purine_pos3': 'Sequence',
+    'aa_hydrophobicity': 'Amino acid', 'aa_charge_pH7': 'Amino acid',
+    'aa_aromatic': 'Amino acid', 'aa_aliphatic': 'Amino acid',
+    'aa_sulfur': 'Amino acid',
+    'degeneracy': 'Degeneracy', 'is_stop': 'Degeneracy',
+}
+
+PROPERTY_GROUP_COLORS = {
+    'Sequence':   '#4E79A7',
+    'Amino acid': '#E15759',
+    'Degeneracy': '#59A14F',
+}
+
+
+def get_curated_properties(codons: List[str]):
+    """Return (matrix, names) for the curated subset of codon properties."""
+    full_matrix, full_names = build_codon_property_matrix(codons)
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
+    keep = [n for n in CURATED_PROPERTIES if n in name_to_idx]
+    indices = [name_to_idx[n] for n in keep]
+    return full_matrix[:, indices], keep
+
+
+def prop_group(name: str) -> str:
+    """Return the display group for a property name."""
+    return PROPERTY_GROUPS.get(name, 'Other')
+
 
 def build_codon_property_matrix(codons: List[str]) -> Tuple[np.ndarray, List[str]]:
     """Build a (64, N_properties) matrix of biologically meaningful codon features.
@@ -794,6 +822,8 @@ def build_codon_property_matrix(codons: List[str]) -> Tuple[np.ndarray, List[str
 
     # --- Nucleotide composition ---
     props['GC_content'] = np.array([_codon_gc(c) for c in codons])
+    props['purine_fraction'] = np.array(
+        [sum(1 for nt in c if nt in 'AG') / 3.0 for c in codons])
     for pos in range(3):
         for nuc in 'ACGT':
             props[f'pos{pos+1}_{nuc}'] = np.array(
@@ -892,13 +922,17 @@ def build_codon_property_matrix(codons: List[str]) -> Tuple[np.ndarray, List[str
 
 def make_codon_property_correlation(model, out_path: str,
                                     tsv_path: Optional[str] = None,
-                                    n_pcs: int = 50, dpi: int = 200):
+                                    n_pcs: int = 30, dpi: int = 200):
     """Correlate codon properties with learned embedding PCs.
 
-    Produces a heatmap of Spearman correlations (properties × PCs) and
-    optionally exports a TSV of all correlations.
+    Single heatmap of Spearman correlations (clustered properties x PCs)
+    with variance-explained bars on top.  Nucleotide-level properties
+    are excluded; only amino acid, degeneracy, and sequence-structure
+    properties are shown.  P-values are FDR-corrected (Benjamini-Hochberg).
     """
     from scipy.stats import spearmanr
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    from scipy.spatial.distance import pdist
     setup_style()
 
     # Extract embeddings
@@ -916,22 +950,41 @@ def make_codon_property_correlation(model, out_path: str,
     pcs = centered @ Vt[:n_pcs].T  # (64, n_pcs)
     var_explained = S[:n_pcs] ** 2 / (S ** 2).sum()
 
-    # Build property matrix
-    prop_matrix, prop_names = build_codon_property_matrix(codons)
+    # Use curated property subset
+    prop_matrix, prop_names = get_curated_properties(codons)
+    n_props = len(prop_names)
+    logger.info(f"  {n_props} curated properties")
+
+    # Remove constant properties
+    nonconstant = [i for i in range(n_props) if prop_matrix[:, i].std() > 1e-12]
+    prop_matrix = prop_matrix[:, nonconstant]
+    prop_names = [prop_names[i] for i in nonconstant]
     n_props = len(prop_names)
 
     # Compute Spearman correlations: (n_props, n_pcs)
     rho_matrix = np.zeros((n_props, n_pcs))
-    pval_matrix = np.zeros((n_props, n_pcs))
+    pval_matrix = np.ones((n_props, n_pcs))
     for i in range(n_props):
-        if prop_matrix[:, i].std() < 1e-12:
-            continue
         for j in range(n_pcs):
             rho, pval = spearmanr(prop_matrix[:, i], pcs[:, j])
             rho_matrix[i, j] = rho
             pval_matrix[i, j] = pval
 
-    # --- Export TSV ---
+    # FDR correction (Benjamini-Hochberg) across all tests
+    pvals_flat = pval_matrix.ravel()
+    n_tests = len(pvals_flat)
+    sort_idx = np.argsort(pvals_flat)
+    ranks = np.empty_like(sort_idx)
+    ranks[sort_idx] = np.arange(1, n_tests + 1)
+    fdr_flat = np.minimum(1.0, pvals_flat * n_tests / ranks)
+    # Enforce monotonicity
+    fdr_sorted = fdr_flat[sort_idx]
+    for k in range(n_tests - 2, -1, -1):
+        fdr_sorted[k] = min(fdr_sorted[k], fdr_sorted[k + 1])
+    fdr_flat[sort_idx] = fdr_sorted
+    fdr_matrix = fdr_flat.reshape(n_props, n_pcs)
+
+    # Export TSV
     if tsv_path:
         rows = []
         for i, pname in enumerate(prop_names):
@@ -942,135 +995,93 @@ def make_codon_property_correlation(model, out_path: str,
                     'var_explained': f'{var_explained[j]:.5f}',
                     'spearman_rho': f'{rho_matrix[i, j]:.5f}',
                     'p_value': f'{pval_matrix[i, j]:.2e}',
+                    'fdr_q': f'{fdr_matrix[i, j]:.2e}',
                 })
         df = pd.DataFrame(rows)
         df.to_csv(tsv_path, sep='\t', index=False)
         logger.info(f"Codon property correlations: {tsv_path}")
 
-    # --- Cluster properties by correlation profile for better heatmap ---
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    from scipy.spatial.distance import pdist
-
-    nonconstant = [i for i in range(n_props)
-                   if prop_matrix[:, i].std() > 1e-12]
-    rho_nc = rho_matrix[nonconstant]
-    names_nc = [prop_names[i] for i in nonconstant]
-
-    if len(nonconstant) > 2:
-        row_dist = pdist(rho_nc, metric='correlation')
+    # Cluster properties by correlation profile
+    if n_props > 2:
+        row_dist = pdist(rho_matrix, metric='correlation')
         row_dist = np.nan_to_num(row_dist, nan=1.0)
         row_link = linkage(row_dist, method='average')
         row_order = leaves_list(row_link)
     else:
-        row_order = np.arange(len(nonconstant))
+        row_order = np.arange(n_props)
 
-    rho_ordered = rho_nc[row_order]
-    names_ordered = [names_nc[i] for i in row_order]
+    rho_ordered = rho_matrix[row_order]
+    fdr_ordered = fdr_matrix[row_order]
+    names_ordered = [prop_names[i] for i in row_order]
 
-    # Group properties for annotation
-    def _get_group(n):
-        if n.startswith('pos') or n.startswith('GC_pos') \
-                or n.startswith('purine_pos'):
-            return 'Nucleotide'
-        if n.startswith('dinuc_'):
-            return 'Dinucleotide'
-        if n.startswith('wobble') or n in ('GC_content', 'total_hbonds',
-                                            'purine_purine_steps'):
-            return 'Sequence'
-        if n.startswith('aa_') or n in ('is_stop', 'is_start'):
-            return 'Amino acid'
-        if 'degenerate' in n or n == 'degeneracy':
-            return 'Degeneracy'
-        return 'Other'
+    # --- Figure: variance bars on top + heatmap below ---
+    fig_height = max(6, n_props * 0.32 + 2.5)
+    fig = plt.figure(figsize=(max(12, n_pcs * 0.45 + 3), fig_height))
+    gs = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[1, 6],
+                           hspace=0.05, left=0.22, right=0.92,
+                           top=0.93, bottom=0.06)
 
-    group_colors = {
-        'Nucleotide': '#4E79A7', 'Dinucleotide': '#F28E2B',
-        'Sequence': '#76B7B2', 'Amino acid': '#E15759',
-        'Degeneracy': '#59A14F', 'Other': '#999999',
-    }
-
-    # --- Figure: top PCs heatmap + full heatmap ---
-    n_top = min(20, n_pcs)
-    fig = plt.figure(figsize=(18, max(12, len(names_ordered) * 0.28 + 3)))
-    gs_main = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 2.2],
-                                wspace=0.35, left=0.18, right=0.96,
-                                top=0.93, bottom=0.06)
-
-    ax_top = fig.add_subplot(gs_main[0, 0])
-    im_top = ax_top.imshow(rho_ordered[:, :n_top], aspect='auto',
-                            cmap='RdBu_r', vmin=-1, vmax=1,
-                            interpolation='nearest')
-    ax_top.set_xticks(range(n_top))
-    ax_top.set_xticklabels(
-        [f'PC{j+1}\n({var_explained[j]:.1%})' for j in range(n_top)],
-        fontsize=FONT_SIZES['bar_value'], rotation=90)
-    ax_top.set_yticks(range(len(names_ordered)))
-    ax_top.set_yticklabels(names_ordered, fontsize=FONT_SIZES['bar_label'])
-    ax_top.set_title(f'Top {n_top} PCs', fontsize=FONT_SIZES['title'],
-                     fontweight='bold')
-
-    for yi, name in enumerate(names_ordered):
-        grp = _get_group(name)
-        ax_top.get_yticklabels()[yi].set_color(group_colors.get(grp, '#333'))
-
-    for i in range(len(names_ordered)):
-        for j in range(n_top):
-            orig_i = nonconstant[row_order[i]]
-            if pval_matrix[orig_i, j] < 0.001:
-                ax_top.text(j, i, '***', ha='center', va='center',
-                           fontsize=4, color='black'
-                           if abs(rho_ordered[i, j]) < 0.6 else 'white')
-            elif pval_matrix[orig_i, j] < 0.01:
-                ax_top.text(j, i, '**', ha='center', va='center',
-                           fontsize=4, color='black'
-                           if abs(rho_ordered[i, j]) < 0.6 else 'white')
-            elif pval_matrix[orig_i, j] < 0.05:
-                ax_top.text(j, i, '*', ha='center', va='center',
-                           fontsize=4, color='black'
-                           if abs(rho_ordered[i, j]) < 0.6 else 'white')
-
-    ax_all = fig.add_subplot(gs_main[0, 1])
-    im_all = ax_all.imshow(rho_ordered, aspect='auto',
-                            cmap='RdBu_r', vmin=-1, vmax=1,
-                            interpolation='nearest')
-    tick_step = max(1, n_pcs // 10)
-    ax_all.set_xticks(range(0, n_pcs, tick_step))
-    ax_all.set_xticklabels(
-        [f'PC{j+1}' for j in range(0, n_pcs, tick_step)],
-        fontsize=FONT_SIZES['bar_value'])
-    ax_all.set_yticks([])
-    ax_all.set_title(f'All {n_pcs} PCs', fontsize=FONT_SIZES['title'],
-                     fontweight='bold')
-
-    ax_var = ax_all.twiny()
+    # Variance explained bar chart (top)
+    ax_var = fig.add_subplot(gs[0])
     ax_var.bar(range(n_pcs), var_explained * 100, color=COLORS['primary'],
-               alpha=0.5, width=0.8)
+               alpha=0.7, width=0.8, edgecolor='none')
     ax_var.set_xlim(-0.5, n_pcs - 0.5)
     ax_var.set_ylabel('% var.', fontsize=FONT_SIZES['secondary_axis'])
-    ax_var.tick_params(labelsize=FONT_SIZES['codon'])
+    ax_var.tick_params(axis='x', labelbottom=False)
+    ax_var.tick_params(axis='y', labelsize=FONT_SIZES['tick_tiny'])
+    ax_var.set_title('Codon properties vs. learned embedding PCs',
+                     fontsize=FONT_SIZES['title'], fontweight='bold', pad=8)
 
-    cbar_ax = fig.add_axes([0.97, 0.15, 0.012, 0.7])
-    cb = fig.colorbar(im_all, cax=cbar_ax)
-    cb.set_label('Spearman ρ', fontsize=FONT_SIZES['colorbar'])
+    # Heatmap (bottom)
+    ax_heat = fig.add_subplot(gs[1])
+    im = ax_heat.imshow(rho_ordered, aspect='auto', cmap='RdBu_r',
+                        vmin=-1, vmax=1, interpolation='nearest')
 
+    ax_heat.set_xticks(range(n_pcs))
+    ax_heat.set_xticklabels([f'PC{j+1}' for j in range(n_pcs)],
+                            fontsize=FONT_SIZES['bar_value'], rotation=90)
+    ax_heat.set_yticks(range(n_props))
+    ax_heat.set_yticklabels(names_ordered, fontsize=FONT_SIZES['bar_label'])
+
+    # Color y-tick labels by group
+    for yi, name in enumerate(names_ordered):
+        grp = prop_group(name)
+        ax_heat.get_yticklabels()[yi].set_color(
+            PROPERTY_GROUP_COLORS.get(grp, '#333'))
+
+    # Significance stars (FDR-corrected)
+    for i in range(n_props):
+        for j in range(n_pcs):
+            q = fdr_ordered[i, j]
+            if q >= 0.05:
+                continue
+            stars = '***' if q < 0.001 else ('**' if q < 0.01 else '*')
+            color = 'white' if abs(rho_ordered[i, j]) > 0.6 else 'black'
+            ax_heat.text(j, i, stars, ha='center', va='center',
+                        fontsize=4, color=color)
+
+    ax_heat.set_xlabel('Principal component')
+
+    # Colorbar
+    cbar_ax = fig.add_axes([0.935, 0.06, 0.012, 0.55])
+    cb = fig.colorbar(im, cax=cbar_ax)
+    cb.set_label('Spearman \u03c1', fontsize=FONT_SIZES['colorbar'])
+
+    # Legend
     from matplotlib.patches import Patch
-    legend_patches = [Patch(facecolor=group_colors[g], label=g)
-                      for g in ['Nucleotide', 'Dinucleotide', 'Sequence',
-                                'Amino acid', 'Degeneracy']]
+    legend_patches = [Patch(facecolor=PROPERTY_GROUP_COLORS[g], label=g)
+                      for g in PROPERTY_GROUP_COLORS]
     fig.legend(handles=legend_patches, fontsize=FONT_SIZES['bar_label'],
-               loc='lower left', bbox_to_anchor=(0.01, 0.01), ncol=5,
+               loc='lower left', bbox_to_anchor=(0.01, 0.01), ncol=3,
                frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
 
     _suptitle(fig,
-        f'Codon properties vs. learned embedding PCs  '
-        f'(Spearman ρ, * p<.05  ** p<.01  *** p<.001)',
-        y=0.97)
+        f'Spearman \u03c1  (* q<.05  ** q<.01  *** q<.001, BH-corrected)',
+        y=0.98, fontsize=FONT_SIZES['annotation'])
 
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
-    # --- Also export the property matrix itself ---
+    # Export property matrix
     if tsv_path:
         prop_tsv = tsv_path.replace('_correlations.tsv', '_matrix.tsv')
         prop_df = pd.DataFrame(prop_matrix, columns=prop_names,
@@ -1081,7 +1092,8 @@ def make_codon_property_correlation(model, out_path: str,
         prop_df.to_csv(prop_tsv, sep='\t')
         logger.info(f"Codon property matrix: {prop_tsv}")
 
-    return rho_matrix, pval_matrix, prop_names, var_explained
+    return rho_matrix, fdr_matrix, prop_names, var_explained
+
 
 
 # ---------------------------------------------------------------------------
@@ -1246,9 +1258,7 @@ def make_dataset_figure(level_results: Dict[str, Dict],
 
     _suptitle(fig, 'Dataset overview', y=1.01)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,9 +1294,7 @@ def make_training_figure(history: Optional[pd.DataFrame],
               f'threshold = {threshold:.3f})',
               y=1.01)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,9 +1349,7 @@ def make_evaluation_figure(level_results: Dict[str, Dict],
 
     _add_panel_letters(fig.axes, 'ABCD', x=-0.06, y=1.06)
 
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -1548,7 +1554,7 @@ def main():
         out_path=_output_path(os.path.join(plot_dir,
                                             'codon_property_pc_correlation.png')),
         tsv_path=os.path.join(plot_dir, 'codon_property_pc_correlations.tsv'),
-        n_pcs=50, dpi=args.dpi)
+        n_pcs=30, dpi=args.dpi)
 
     # ---- Figure 4: Dataset overview --------------------------------------
     logger.info("Generating dataset overview figure ...")
