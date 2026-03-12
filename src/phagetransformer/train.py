@@ -516,7 +516,6 @@ def main():
         logger.info("Loading bacterial genomes …")
         genome_store = BacterialGenomeStore(
             args.host_genome_dir,
-            num_workers=args.num_workers,
             seed=args.seed,
             one_per_genus=args.one_genome_per_genus,
         )

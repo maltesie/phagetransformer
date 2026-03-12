@@ -20,11 +20,8 @@ Usage:
 import argparse
 import logging
 import os
-import random
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
@@ -40,7 +37,7 @@ from phagetransformer.dataset import (
 )
 from eval_utils import (
     COLORS, LEVEL_NAMES, FONT_SIZES,
-    setup_style, _add_panel_letters, _output_path, _suptitle,
+    setup_style, _add_panel_letters, _suptitle,
     enable_presentation_mode,
     collect_logits, parse_lineages, aggregate_to_level,
 )
@@ -69,14 +66,18 @@ def sample_bacteria(model, genome_store, hosts, temperature, tokenizer,
     Returns (genus_logits, genus_labels, bact_logits, bact_labels,
              genus_to_idx).
     """
+    # hosts includes bacterial_fragment as the last entry — that's the
+    # model's output layout.  genus_to_idx maps only real genera.
     genus_to_idx = {}
     for i, h in enumerate(hosts):
+        if h == 'bacterial_fragment':
+            continue
         genus = h.split(';')[-1] if ';' in h else h
         genus_to_idx[genus] = i
 
-    n_host_classes = len(hosts)
-    agg_num_classes = n_host_classes + 1
-    bact_idx = agg_num_classes - 1
+    agg_num_classes = len(hosts)  # includes bacterial_fragment
+    bact_idx = list(hosts).index('bacterial_fragment')
+    n_genus_classes = agg_num_classes - 1
 
     ds = BacterialSequenceDataset(
         genome_store, tokenizer, phage_lengths,
@@ -98,9 +99,9 @@ def sample_bacteria(model, genome_store, hosts, temperature, tokenizer,
     logits, labels = collect_logits(model, loader, device)
     logger.info(f"  logits: {logits.shape}  labels: {labels.shape}")
 
-    genus_logits = logits[:, :n_host_classes]
+    genus_logits = logits[:, :n_genus_classes]
     bact_logits = logits[:, bact_idx]
-    genus_labels = labels[:, :n_host_classes]
+    genus_labels = labels[:, :n_genus_classes]
     bact_labels = labels[:, bact_idx]
 
     n_with_genus = (genus_labels.sum(1) > 0).sum().item()
@@ -136,9 +137,11 @@ class ChimeraDataset(Dataset):
         for sp in genome_store.species_list:
             genus_to_species[sp.split()[0]].append(sp)
 
-        # Build genus_to_idx
+        # Build genus_to_idx (skip bacterial_fragment)
         genus_to_idx = {}
         for i, h in enumerate(hosts):
+            if h == 'bacterial_fragment':
+                continue
             genus = h.split(';')[-1] if ';' in h else h
             genus_to_idx[genus] = i
 
@@ -178,25 +181,35 @@ class ChimeraDataset(Dataset):
                     self.samples.append((phage_seq, ratio, genus_idx))
                     continue
 
+                # Pick a bacterial species from the correct host genus
+                sp = rng.choice(genus_to_species[genus])
+                bact_genome = genome_store.genomes[sp]
+                val_start, val_end = genome_store.splits[sp]['val']
+                val_len = val_end - val_start
+
+                # Sample a chunk from the val region
+                want = min(bact_len, val_len)
+                if val_len <= bact_len:
+                    bact_chunk = bact_genome[val_start:val_end]
+                else:
+                    offset = rng.randint(0, val_len - bact_len)
+                    bact_chunk = bact_genome[val_start + offset:
+                                             val_start + offset + bact_len]
+                # Pad by repeating if val region is shorter than needed
+                if len(bact_chunk) < bact_len:
+                    reps = bact_len // len(bact_chunk) + 1
+                    bact_chunk = (bact_chunk * reps)[:bact_len]
+
                 if bact_len >= seq_len:
                     # Pure bacterial
-                    sp = rng.choice(genus_to_species[genus])
-                    bact_seq, _ = genome_store.sample_subseq('val', seq_len)
-                    self.samples.append((bact_seq[:seq_len], ratio, genus_idx))
+                    self.samples.append((bact_chunk[:seq_len], ratio, genus_idx))
                     continue
 
                 # Create chimera: cut a piece from phage, replace with bacterial
                 cut_start = rng.randint(0, max(1, seq_len - bact_len))
                 cut_end = cut_start + bact_len
 
-                # Get bacterial insert
-                sp = rng.choice(genus_to_species[genus])
-                bact_chunk, _ = genome_store.sample_subseq('val', bact_len)
-                if len(bact_chunk) < bact_len:
-                    bact_chunk = bact_chunk + bact_chunk  # repeat if short
-                bact_chunk = bact_chunk[:bact_len]
-
-                chimera = phage_seq[:cut_start] + bact_chunk + phage_seq[cut_end:]
+                chimera = phage_seq[:cut_start] + bact_chunk[:bact_len] + phage_seq[cut_end:]
                 assert len(chimera) == seq_len, \
                     f"Chimera length {len(chimera)} != {seq_len}"
                 self.samples.append((chimera, ratio, genus_idx))
@@ -236,13 +249,15 @@ class ChimeraDataset(Dataset):
 def run_chimera_experiment(model, phage_seqs, phage_labels, hosts,
                            genome_store, temperature, tokenizer, device,
                            patch_nt_len, max_patches, eval_stride,
-                           n_per_ratio, batch_size, num_workers):
+                           n_per_ratio, batch_size, num_workers,
+                           threshold=0.5):
     """Create chimeric sequences and measure bacterial_fragment score.
 
     Returns DataFrame with columns: ratio, bact_score.
     """
     ratios = np.linspace(0, 1, 11)  # 0.0, 0.1, ..., 1.0
-    n_host_classes = len(hosts)
+    bact_idx = list(hosts).index('bacterial_fragment')
+    n_genus_classes = bact_idx  # all columns before bacterial_fragment
 
     ds = ChimeraDataset(
         phage_seqs, phage_labels, hosts, genome_store, tokenizer,
@@ -260,36 +275,38 @@ def run_chimera_experiment(model, phage_seqs, phage_labels, hosts,
     logger.info(f"  Running inference on {len(ds)} chimeric sequences ...")
     logits, meta_labels = collect_logits(model, loader, device)
 
-    # Extract bacterial_fragment logit (last column beyond host classes)
-    if logits.shape[1] > n_host_classes:
-        bact_logits = logits[:, n_host_classes]
-    else:
-        bact_logits = torch.full((len(logits),), -10.0)
-
+    # Extract bacterial_fragment logit and genus logits
+    bact_logits = logits[:, bact_idx]
     bact_scores = torch.sigmoid(bact_logits / temperature).numpy()
     ratios_out = meta_labels[:, 0].numpy()
     true_genus_indices = meta_labels[:, 1].long()
 
-    # Check genus prediction correctness
-    genus_logits = logits[:, :n_host_classes]
+    # Check genus prediction correctness: true genus prob above threshold
+    genus_logits = logits[:, :n_genus_classes]
     genus_probs = torch.sigmoid(genus_logits / temperature)
 
     genus_correct = []
+    genus_prob_vals = []
     for i in range(len(logits)):
-        gi = true_genus_indices[i].item()
-        true_prob = genus_probs[i, int(gi)].item()
-        # Correct if the true genus has the highest prob among all genera
-        best_prob = genus_probs[i].max().item()
-        genus_correct.append(true_prob >= best_prob - 1e-6)
+        gi = int(true_genus_indices[i].item())
+        true_prob = genus_probs[i, gi].item()
+        genus_correct.append(true_prob >= threshold)
+        genus_prob_vals.append(true_prob)
 
     df = pd.DataFrame({
         'ratio': ratios_out,
         'bact_score': bact_scores,
         'genus_correct': genus_correct,
+        'genus_prob': genus_prob_vals,
     })
     logger.info(f"  Chimera results: {len(df)} samples across "
                 f"{df['ratio'].nunique()} ratios, "
                 f"genus correct: {df['genus_correct'].mean():.1%}")
+    # Log per-ratio breakdown
+    for ratio, group in df.groupby('ratio'):
+        logger.info(f"    ratio={ratio:.1f}: genus_correct={group['genus_correct'].mean():.1%}, "
+                    f"genus_prob={group['genus_prob'].median():.3f} (median), "
+                    f"bact_score={group['bact_score'].median():.3f} (median)")
     return df
 
 
@@ -335,7 +352,7 @@ def _compute_pr_curve(probs, labels, n_thresholds=200):
 def _compute_auprc(precision, recall):
     """Area under the PR curve (trapezoidal)."""
     order = np.argsort(recall)
-    return np.trapz(precision[order], recall[order])
+    return np.trapezoid(precision[order], recall[order])
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +457,6 @@ def plot_classification_pr(ax, genus_probs, genus_labels, hosts):
     ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
-    ax.set_aspect('equal')
 
 
 def plot_detection_violins(ax, bact_probs_bact, genus_labels_bact,
@@ -606,19 +622,20 @@ def main():
     parser.add_argument('--host_genome_dir', type=str, required=True,
                         help='Directory with host_genome_manifest.tsv and '
                              'genome FASTA files')
-    parser.add_argument('--output', '-o', type=str,
-                        default='bacteria_evaluation.png',
-                        help='Output filename')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Output filename (default: <model_dir>/plots/bacteria_evaluation.png)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--threshold', type=float, default=None,
-                        help='Score threshold (default: from calibration)')
-    parser.add_argument('--fdr', type=float, default=None,
-                        help='FDR level (default: 0.2 if --threshold not set)')
+                        help='Fixed score threshold (overrides --fdr)')
+    parser.add_argument('--fdr', type=float, default=0.1,
+                        help='FDR level for threshold from calibration')
     parser.add_argument('--n_samples', type=int, default=5000,
                         help='Number of bacterial subsequences to sample')
     parser.add_argument('--n_chimeras', type=int, default=100,
                         help='Number of chimeric sequences per ratio')
+    parser.add_argument('--one_per_genus', action='store_true',
+                        help='Load only one genome per genus')
     parser.add_argument('--max_patches', type=int, default=512)
     parser.add_argument('--eval_stride', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -651,12 +668,11 @@ def main():
         threshold = args.threshold
         logger.info(f"Threshold (fixed): {threshold:.4f}")
     else:
-        fdr = args.fdr if args.fdr is not None else 0.2
-        fdr_key = f"fdr_{int(fdr * 100):02d}"
+        fdr_key = f"fdr_{int(args.fdr * 100):02d}"
         fdr_thresholds = calib.get('fdr_thresholds', {})
         if fdr_key in fdr_thresholds:
             threshold = fdr_thresholds[fdr_key]
-            logger.info(f"Threshold (FDR {fdr*100:.0f}%): {threshold:.4f}")
+            logger.info(f"Threshold (FDR {args.fdr*100:.0f}%): {threshold:.4f}")
         else:
             threshold = calib.get('threshold', 0.5)
             logger.warning(f"FDR key '{fdr_key}' not in calibration, "
@@ -674,7 +690,9 @@ def main():
 
     # ---- load bacterial genomes ------------------------------------------
     logger.info("Loading bacterial genomes ...")
-    genome_store = BacterialGenomeStore(args.host_genome_dir)
+    genome_store = BacterialGenomeStore(
+        args.host_genome_dir,
+        one_per_genus=args.one_per_genus)
 
     # Load train/val splits from training run
     splits_path = os.path.join(args.model_dir, 'logs', 'bacterial_species.tsv')
@@ -711,6 +729,7 @@ def main():
         n_per_ratio=args.n_chimeras,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        threshold=threshold,
     )
 
     # ---- convert to probs ------------------------------------------------
@@ -731,13 +750,23 @@ def main():
     logger.info(f"  Classification: {has_genus.sum()} samples with matching "
                 f"host genus")
 
+    # genus_hosts excludes bacterial_fragment — used for plotting functions
+    # where labels have n_genus columns matching genus_hosts
+    genus_hosts = hosts[hosts != 'bacterial_fragment']
+    logger.info(f"  {len(genus_hosts)} genus classes, "
+                f"{len(hosts)} total (incl. bacterial_fragment)")
+
     # ---- generate figure -------------------------------------------------
+    plot_dir = os.path.join(args.model_dir, 'plots')
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = args.output or os.path.join(plot_dir, 'bacteria_evaluation.png')
+
     logger.info("Generating bacterial evaluation figure ...")
     make_bacteria_figure(
         genus_probs_cls, genus_labels_cls,
         bact_probs_b, genus_labels_b,
-        hosts, threshold, chimera_df,
-        out_path=args.output, dpi=args.dpi)
+        genus_hosts, threshold, chimera_df,
+        out_path=out_path, dpi=args.dpi)
 
     logger.info("Done.")
 

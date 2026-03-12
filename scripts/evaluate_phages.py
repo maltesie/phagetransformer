@@ -13,13 +13,11 @@ import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from phagetransformer.model import CodonTokenizer
@@ -1442,7 +1440,7 @@ def _compute_auprc(precision, recall):
     order = np.argsort(recall)
     r_sorted = recall[order]
     p_sorted = precision[order]
-    return np.trapz(p_sorted, r_sorted)
+    return np.trapezoid(p_sorted, r_sorted)
 
 
 def _plot_pr_panel(ax, probs_per_level, labels_per_level, level_names,
@@ -1579,9 +1577,9 @@ def main():
     parser.add_argument('--testset_dir', type=str, default=None,
                         help='Override testset directory')
     parser.add_argument('--threshold', type=float, default=None,
-                        help='Score threshold (default: from calibration.json)')
-    parser.add_argument('--fdr', type=float, default=None,
-                        help='Use FDR threshold from calibration (e.g. 0.1)')
+                        help='Fixed score threshold (overrides --fdr)')
+    parser.add_argument('--fdr', type=float, default=0.1,
+                        help='FDR level for threshold from calibration')
     parser.add_argument('--max_patches', type=int, default=512)
     parser.add_argument('--eval_stride', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -1618,20 +1616,19 @@ def main():
     blocked_classes = calib.get('blocked_classes', [])
 
     # Determine threshold
-    if args.fdr is not None:
+    if args.threshold is not None:
+        threshold = args.threshold
+        logger.info(f"Threshold (fixed): {threshold:.4f}")
+    else:
         fdr_key = f"fdr_{int(args.fdr * 100):02d}"
         fdr_thresholds = calib.get('fdr_thresholds', {})
         if fdr_key in fdr_thresholds:
             threshold = fdr_thresholds[fdr_key]
-            logger.info(f"Using FDR {args.fdr} threshold: {threshold:.4f}")
+            logger.info(f"Threshold (FDR {args.fdr*100:.0f}%): {threshold:.4f}")
         else:
-            logger.warning(f"FDR key '{fdr_key}' not in calibration, "
-                          f"available: {list(fdr_thresholds.keys())}")
             threshold = calib.get('threshold', 0.5)
-    elif args.threshold is not None:
-        threshold = args.threshold
-    else:
-        threshold = calib.get('threshold', 0.5)
+            logger.warning(f"FDR key '{fdr_key}' not in calibration, "
+                          f"using default threshold {threshold:.4f}")
 
     logger.info(f"Threshold: {threshold:.4f}  Temperature: {temperature:.4f}")
 

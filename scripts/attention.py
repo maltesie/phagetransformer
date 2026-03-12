@@ -377,7 +377,7 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
 
     # Each genome gets 2 rows: gene track (thin) + heatmap
     fig_height = max(3.0, 1.6 * n + 1.5)
-    fig, axes = plt.subplots(n, 1, figsize=(14, fig_height), squeeze=False,
+    fig, axes = plt.subplots(n, 1, figsize=(20, fig_height), squeeze=False,
                              gridspec_kw={'hspace': 0.55})
 
     # Shared color range across all genomes

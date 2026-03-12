@@ -13,7 +13,7 @@ Usage:
 import argparse
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -516,9 +516,8 @@ def main():
     parser.add_argument('--threshold', type=float, default=None,
                         help='Fixed score threshold for PT predictions '
                              '(overrides --fdr)')
-    parser.add_argument('--fdr', type=float, default=None,
-                        help='FDR level for PT threshold from calibration '
-                             '(default: 0.2 if --threshold not set)')
+    parser.add_argument('--fdr', type=float, default=0.1,
+                        help='FDR level for PT threshold from calibration')
     parser.add_argument('--max_patches', type=int, default=512)
     parser.add_argument('--eval_stride', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -551,12 +550,11 @@ def main():
         pt_threshold = args.threshold
         logger.info(f"PT threshold (fixed): {pt_threshold:.4f}")
     else:
-        fdr = args.fdr if args.fdr is not None else 0.2
-        fdr_key = f"fdr_{int(fdr * 100):02d}"
+        fdr_key = f"fdr_{int(args.fdr * 100):02d}"
         fdr_thresholds = calib.get('fdr_thresholds', {})
         if fdr_key in fdr_thresholds:
             pt_threshold = fdr_thresholds[fdr_key]
-            logger.info(f"PT threshold (FDR {fdr*100:.0f}%): "
+            logger.info(f"PT threshold (FDR {args.fdr*100:.0f}%): "
                         f"{pt_threshold:.4f}")
         else:
             pt_threshold = calib.get('threshold', 0.5)

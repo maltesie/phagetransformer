@@ -84,18 +84,14 @@ class BacterialGenomeStore:
         Directory containing ``host_genome_manifest.tsv``.
     val_frac : float
         Fraction of each genome reserved for validation (random contiguous region).
-    num_workers : int
-        Threads for parallel FASTA loading.
     seed : int
         Random seed for reproducible val region placement.
     """
 
     def __init__(self, host_genome_dir: str,
                  val_frac: float = 0.2,
-                 num_workers: int = 8,
                  seed: int = 42,
                  one_per_genus: bool = False):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         manifest = os.path.join(host_genome_dir, 'host_genome_manifest.tsv')
         if not os.path.exists(manifest):
@@ -126,32 +122,22 @@ class BacterialGenomeStore:
                         f"{len(filtered)} entries ({len(seen_genera)} genera)")
             entries = filtered
 
-        # Load genomes in parallel
-        logger.info(f"  Loading {len(entries)} bacterial genomes "
-                    f"({num_workers} threads) …")
+        # Load genomes
+        logger.info(f"  Loading {len(entries)} bacterial genomes …")
         t0 = time.time()
         genomes = {}   # species -> sequence
         n_skipped = 0
 
-        def _load_one(species_path):
-            species, path = species_path
+        for species, path in entries:
             if not os.path.exists(path):
-                return species, None, f"not found: {path}"
+                logger.warning(f"    {species}: not found: {path}")
+                n_skipped += 1
+                continue
             try:
-                seq = _read_fasta_raw(path)
-                return species, seq, None
+                genomes[species] = _read_fasta_raw(path)
             except Exception as e:
-                return species, None, str(e)
-
-        with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = [pool.submit(_load_one, e) for e in entries]
-            for fut in as_completed(futures):
-                species, seq, err = fut.result()
-                if err:
-                    logger.warning(f"    {species}: {err}")
-                    n_skipped += 1
-                else:
-                    genomes[species] = seq
+                logger.warning(f"    {species}: {e}")
+                n_skipped += 1
 
         elapsed = time.time() - t0
         logger.info(f"  Loaded {len(genomes)} genomes in {elapsed:.1f}s "
