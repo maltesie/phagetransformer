@@ -103,8 +103,12 @@ def predict_window(model, tokenizer, seq: str, patch_nt_len: int,
 @torch.no_grad()
 def scan_genome(model, tokenizer, seq: str, patch_nt_len: int,
                 device: torch.device, window_size: int, stride: int,
-                host_list: list, max_patches: int = 4096) -> dict:
+                host_list: list, max_patches: int = 4096,
+                ignore_idx: Optional[int] = None) -> dict:
     """Slide a window along a genome, collecting predictions per window.
+
+    If *ignore_idx* is set, that class is excluded when determining
+    the top prediction per window (but kept in all_probs).
 
     Returns dict with:
         windows     : list of (start_nt, end_nt) tuples
@@ -141,7 +145,13 @@ def scan_genome(model, tokenizer, seq: str, patch_nt_len: int,
 
         probs = predict_window(model, tokenizer, chunk, patch_nt_len,
                                device, max_patches)
-        top_idx = int(np.argmax(probs))
+        # Determine top prediction, optionally ignoring a class
+        if ignore_idx is not None:
+            probs_masked = probs.copy()
+            probs_masked[ignore_idx] = -1.0
+            top_idx = int(np.argmax(probs_masked))
+        else:
+            top_idx = int(np.argmax(probs))
         top_conf = float(probs[top_idx])
 
         all_probs.append(probs)
@@ -182,7 +192,8 @@ def scan_genome(model, tokenizer, seq: str, patch_nt_len: int,
 def extract_regions(scan: dict, threshold: float,
                     host_list: list,
                     min_region_nt: int = 5000,
-                    merge_gap_nt: int = 10000) -> list:
+                    merge_gap_nt: int = 10000,
+                    ignore_idx: Optional[int] = None) -> list:
     """Extract contiguous regions above confidence threshold.
 
     Returns list of dicts:
@@ -230,7 +241,12 @@ def extract_regions(scan: dict, threshold: float,
 
         if region_probs:
             mean_probs = np.mean(region_probs, axis=0)
-            best_idx = int(np.argmax(mean_probs))
+            if ignore_idx is not None:
+                mean_probs_masked = mean_probs.copy()
+                mean_probs_masked[ignore_idx] = -1.0
+                best_idx = int(np.argmax(mean_probs_masked))
+            else:
+                best_idx = int(np.argmax(mean_probs))
             predicted_host = (host_list[best_idx] if best_idx < len(host_list)
                               else f'class_{best_idx}')
         else:
@@ -256,6 +272,7 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
               threshold: float, out_path: str,
               host_list: list,
               genes: Optional[list] = None,
+              ignore_idx: Optional[int] = None,
               dpi: int = 150):
     """Plot genome-wide prophage scan as a coloured confidence line.
 
@@ -280,8 +297,14 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
 
     # Per-window: midpoint (kb), max confidence, argmax class
     mid_kb = np.array([(ws + we) / 2000.0 for ws, we in windows])
-    max_conf = all_probs.max(axis=1)
-    max_class = all_probs.argmax(axis=1)
+    if ignore_idx is not None:
+        probs_masked = all_probs.copy()
+        probs_masked[:, ignore_idx] = -1.0
+        max_conf = probs_masked.max(axis=1)
+        max_class = probs_masked.argmax(axis=1)
+    else:
+        max_conf = all_probs.max(axis=1)
+        max_class = all_probs.argmax(axis=1)
 
     has_genes = genes is not None and len(genes) > 0
     n_panels = 2 if has_genes else 1
@@ -446,6 +469,9 @@ def main():
                              'this many nt')
     parser.add_argument('--first_n', type=int, default=1,
                         help='Number of sequences to scan')
+    parser.add_argument('--ignore_bacterial', action='store_true',
+                        help='Ignore the bacterial_fragment class when '
+                             'determining top predictions and labels')
     parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
@@ -468,6 +494,15 @@ def main():
 
     patch_nt_len = calib['model_config']['patch_nt_len']
     host_list = [h.split(';')[-1] for h in calib.get('host_list', calib.get('hosts', []))]
+
+    # Detect bacterial_fragment index
+    ignore_idx = None
+    if args.ignore_bacterial:
+        try:
+            ignore_idx = host_list.index('bacterial_fragment')
+            logger.info(f"  Ignoring bacterial_fragment class (index {ignore_idx})")
+        except ValueError:
+            logger.info("  No bacterial_fragment class found, nothing to ignore")
 
     # ---- read input ---------------------------------------------------------
     logger.info(f"Reading {args.input} …")
@@ -512,12 +547,13 @@ def main():
         scan = scan_genome(
             model, tokenizer, seq, patch_nt_len, device,
             window_size=args.window_size, stride=args.stride,
-            host_list=host_list,
+            host_list=host_list, ignore_idx=ignore_idx,
         )
 
         regions = extract_regions(
             scan, threshold=args.threshold, host_list=host_list,
             min_region_nt=args.min_region, merge_gap_nt=args.merge_gap,
+            ignore_idx=ignore_idx,
         )
 
         logger.info(f"  {len(regions)} candidate prophage region(s) "
@@ -529,7 +565,8 @@ def main():
                         f"host={reg['predicted_host']}")
 
         plot_scan(scan, sid, len(seq), args.threshold,
-                  plot_path, host_list, genes=genes)
+                  plot_path, host_list, genes=genes,
+                  ignore_idx=ignore_idx)
 
         if regions:
             write_regions_tsv(regions, sid, tsv_path)
