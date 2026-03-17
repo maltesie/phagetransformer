@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -28,16 +29,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 COLORS = {
-    'primary':    '#2C5F8A',
-    'secondary':  '#D4563E',
-    'tertiary':   '#3A8A6E',
-    'quaternary': '#E8983E',
-    'quinary':    '#7B5EA7',
-    'senary':     '#C47BA0',
-    'light_bg':   '#FFFFFF',
-    'grid':       '#D0CFC8',
-    'text':       '#2D2D2D',
-    'text_light': '#6B6B6B',
+    'primary':       '#2C5F8A',
+    'secondary':     '#D4563E',
+    'tertiary':      '#3A8A6E',
+    'quaternary':    '#E8983E',
+    'quinary':       '#7B5EA7',
+    'senary':        '#C47BA0',
+    'light_bg':      '#FFFFFF',
+    'grid':          '#D0CFC8',
+    'text':          '#2D2D2D',
+    'text_light':    '#6B6B6B',
+    'gene_fwd':      '#B22222',
+    'gene_rev':      '#FF8C00',
+    'threshold':     '#B2182B',
+    'dark_overlay':  '#333333',
 }
 
 METRIC_COLORS = {
@@ -56,26 +61,23 @@ LEVEL_NAMES = ['Phylum', 'Class', 'Order', 'Family', 'Genus']
 # ---------------------------------------------------------------------------
 
 FONT_SIZES = {
-    'base':           11,
-    'suptitle':       12,
-    'title':          11,
+    'panel_letter':   14,
+    'title':          12,
     'label':          11,
-    'tick':           10,
-    'tick_small':      9,
-    'tick_tiny':       7.5,
-    'legend':         10,
-    'legend_small':    8,
-    'annotation':      8,
-    'bar_value':       6,
-    'bar_label':       7,
-    'panel_letter':   13,
-    'codon':           5.5,
-    'colorbar':        9,
-    'secondary_axis':  7,
-    'fallback_msg':   10,
+    'legend':          9,
+    'overlay':         7,
+    'overlay_small':   5.5,
 }
 
 PRESENTATION_MODE = False
+
+# Standard figure width (inches) — keeps font sizes consistent across plots
+# when figures are scaled to the same column width in a document.
+FIG_WIDTH = 12
+
+# Standard height per row of panels.  One-row figures use FIG_HEIGHT_ROW,
+# two-row figures use 2 * FIG_HEIGHT_ROW.
+FIG_HEIGHT_ROW = 4.5
 
 
 def setup_style():
@@ -83,10 +85,10 @@ def setup_style():
     mpl.rcParams.update({
         'font.family': 'sans-serif',
         'font.sans-serif': ['Arial', 'DejaVu Sans', 'Helvetica'],
-        'font.size': FONT_SIZES['base'],
+        'font.size': FONT_SIZES['label'],
         'axes.titlesize': FONT_SIZES['title'],
         'axes.titleweight': 'bold',
-        'axes.labelsize': FONT_SIZES['label'],
+        'axes.labelsize': FONT_SIZES['title'],
         'axes.labelcolor': COLORS['text'],
         'axes.edgecolor': COLORS['grid'],
         'axes.facecolor': 'white',
@@ -95,8 +97,8 @@ def setup_style():
         'grid.color': COLORS['grid'],
         'grid.linewidth': 0.5,
         'grid.alpha': 0.6,
-        'xtick.labelsize': FONT_SIZES['tick'],
-        'ytick.labelsize': FONT_SIZES['tick'],
+        'xtick.labelsize': FONT_SIZES['label'],
+        'ytick.labelsize': FONT_SIZES['label'],
         'xtick.color': COLORS['text_light'],
         'ytick.color': COLORS['text_light'],
         'legend.fontsize': FONT_SIZES['legend'],
@@ -132,18 +134,30 @@ def _suptitle(fig, title: str, **kwargs):
     """Add figure suptitle unless in presentation mode."""
     if PRESENTATION_MODE:
         return
-    kwargs.setdefault('fontsize', FONT_SIZES['suptitle'])
+    kwargs.setdefault('fontsize', FONT_SIZES['title'])
     kwargs.setdefault('fontweight', 'bold')
     kwargs.setdefault('color', COLORS['text'])
     fig.suptitle(title, **kwargs)
 
 
-def enable_presentation_mode(scale: float = 1.5):
+def enable_presentation_mode(scale: float = 1.3):
     """Scale font sizes for presentations and disable panel letters."""
     global PRESENTATION_MODE
     PRESENTATION_MODE = True
     for key in FONT_SIZES:
         FONT_SIZES[key] = round(FONT_SIZES[key] * scale, 1)
+
+
+def _save_figure(fig, out_path: str, dpi: int = 200):
+    """Save figure as PNG, PDF, and SVG."""
+    fig.savefig(out_path, dpi=dpi)
+    logger.info(f"Figure saved: {out_path}")
+    root = os.path.splitext(out_path)[0]
+    for ext in ('.pdf', '.svg'):
+        path = root + ext
+        fig.savefig(path)
+        logger.info(f"Figure saved: {path}")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +229,7 @@ def predict_test_for_comparison(
     """
     dummy_labels = np.zeros((len(seqs), len(hosts)), dtype=np.float32)
 
-    stride = (eval_stride or int(patch_nt_len * 2/3)) // 3 * 3
+    stride = eval_stride or patch_nt_len // 2
     ds = PatchSequenceDataset(
         seqs, dummy_labels, tokenizer,
         patch_nt_len=patch_nt_len, max_patches=max_patches,
@@ -230,9 +244,9 @@ def predict_test_for_comparison(
     logits, _ = collect_logits(model, loader, device)
     all_probs = torch.sigmoid(logits / temperature)
 
-    has_bact_class = hosts[-1] == 'bacterial_fragment'
-    n_core = len(hosts) - 1 if has_bact_class else len(hosts)
-
+    
+    has_bact_class = hosts[-1] == "bacterial_fragment"
+    n_core = len(hosts) - 1
     core_probs = all_probs[:, :n_core]
 
     rows = []

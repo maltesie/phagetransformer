@@ -27,6 +27,11 @@ import numpy as np
 import torch
 
 from phagetransformer.model import CodonTokenizer
+from eval_utils import (
+    COLORS, FIG_WIDTH, FIG_HEIGHT_ROW,
+    setup_style, _save_figure, _output_path,
+    enable_presentation_mode,
+)
 from phagetransformer.predict import (
     read_fasta,
     load_model_and_calibration,
@@ -285,6 +290,8 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
     from matplotlib.collections import LineCollection
     from matplotlib.colors import hsv_to_rgb
 
+    setup_style()
+
     windows = scan['windows']
     all_probs = scan['all_probs']           # (n_windows, num_classes)
     n_windows, n_classes = all_probs.shape
@@ -310,7 +317,7 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
     n_panels = 2 if has_genes else 1
     height_ratios = [3, 1] if has_genes else [1]
 
-    fig, axes = plt.subplots(n_panels, 1, figsize=(16, 3 + 1.5 * n_panels),
+    fig, axes = plt.subplots(n_panels, 1, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW),
                              gridspec_kw={'height_ratios': height_ratios,
                                           'hspace': 0.3},
                              squeeze=False)
@@ -334,19 +341,20 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
                color=colors[max_class[0] % len(colors)], alpha=0.6)
 
     # Threshold line
-    ax.axhline(threshold, color='#B2182B', linewidth=1.0, linestyle='--',
-               alpha=0.8, label=f'Threshold ({threshold:.2f})')
+    ax.axhline(threshold, color=COLORS['threshold'], linewidth=1.0,
+               linestyle='--', alpha=0.8,
+               label=f'Threshold ({threshold:.2f})')
 
     ax.set_xlim(0, seq_len / 1000)
     ax.set_ylim(0, 1.05)
-    ax.set_ylabel('Max prediction\nprobability', fontsize=10)
+    ax.set_ylabel('Max prediction\nprobability')
 
     # Legend for genera that appear as top prediction above threshold
     active_classes = set()
     for i in range(n_windows):
         if max_conf[i] >= threshold:
             active_classes.add(max_class[i])
-    legend_handles = [mpatches.Patch(facecolor='#B2182B', alpha=0.3,
+    legend_handles = [mpatches.Patch(facecolor=COLORS['threshold'], alpha=0.3,
                                      label=f'Threshold ({threshold:.2f})')]
     for ci in sorted(active_classes):
         label = (host_list[ci] if ci < len(host_list)
@@ -354,28 +362,29 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
         legend_handles.append(
             mpatches.Patch(facecolor=colors[ci % len(colors)],
                            alpha=0.85, label=label))
-    ax.legend(handles=legend_handles, loc='upper right',
-              fontsize=7, framealpha=0.9, ncol=min(4, len(legend_handles)))
+    ax.legend(handles=legend_handles, loc='lower right',
+              framealpha=0.9, edgecolor=COLORS['grid'],
+              ncol=min(4, len(legend_handles)))
 
     if not has_genes:
-        ax.set_xlabel('Genome position (kb)', fontsize=10)
+        ax.set_xlabel('Genome position (kb)')
 
     # Title
     n_above = sum(1 for c in max_conf if c >= threshold)
     title = (f'Prophage scan: {seq_id}  ({seq_len:,} nt) — '
              f'{n_above}/{n_windows} windows above threshold')
-    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.set_title(title,
+                 color=COLORS['text'])
 
     # --- Gene track ---
     if has_genes:
         ax_g = axes[1, 0]
-        gene_colors_fwd = '#4393C3'
-        gene_colors_rev = '#F4A582'
 
         for gene in genes:
             start_kb = (gene['begin'] - 1) / 1000
             width_kb = (gene['end'] - gene['begin'] + 1) / 1000
-            color = gene_colors_fwd if gene['strand'] == 1 else gene_colors_rev
+            color = (COLORS['gene_fwd'] if gene['strand'] == 1
+                     else COLORS['gene_rev'])
             y = 0.55 if gene['strand'] == 1 else 0.15
             rect = mpatches.FancyBboxPatch(
                 (start_kb, y), width_kb, 0.3,
@@ -386,27 +395,21 @@ def plot_scan(scan: dict, seq_id: str, seq_len: int,
         ax_g.set_xlim(0, seq_len / 1000)
         ax_g.set_ylim(0, 1)
         ax_g.set_yticks([0.3, 0.7])
-        ax_g.set_yticklabels(['Rev', 'Fwd'], fontsize=8)
-        ax_g.set_xlabel('Genome position (kb)', fontsize=10)
-        ax_g.set_ylabel('CDS', fontsize=10)
+        ax_g.set_yticklabels(['Rev', 'Fwd'])
+        ax_g.set_xlabel('Genome position (kb)')
+        ax_g.set_ylabel('CDS')
 
         legend_patches = [
-            mpatches.Patch(facecolor=gene_colors_fwd, alpha=0.7,
+            mpatches.Patch(facecolor=COLORS['gene_fwd'], alpha=0.7,
                            label='Forward CDS'),
-            mpatches.Patch(facecolor=gene_colors_rev, alpha=0.7,
+            mpatches.Patch(facecolor=COLORS['gene_rev'], alpha=0.7,
                            label='Reverse CDS'),
         ]
         ax_g.legend(handles=legend_patches, loc='upper right',
-                    fontsize=7, framealpha=0.9)
+                    framealpha=0.9, edgecolor=COLORS['grid'])
 
-    fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
-    logger.info(f"Scan plot saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
+    out_path = _output_path(out_path)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -473,10 +476,15 @@ def main():
                         help='Ignore the bacterial_fragment class when '
                              'determining top predictions and labels')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--presentation', action='store_true',
+                        help='Increase font sizes for presentations')
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
+
+    if args.presentation:
+        enable_presentation_mode()
 
     if args.stride is None:
         args.stride = args.window_size // 2

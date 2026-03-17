@@ -25,8 +25,8 @@ import torch
 from phagetransformer.model import CodonTokenizer
 from phagetransformer.predict import load_model_and_calibration
 from eval_utils import (
-    COLORS, LEVEL_NAMES, FONT_SIZES,
-    setup_style, _suptitle, enable_presentation_mode,
+    COLORS, LEVEL_NAMES, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
+    setup_style, _suptitle, _save_figure, enable_presentation_mode,
     load_test_with_ids, predict_test_for_comparison,
 )
 
@@ -281,7 +281,7 @@ def plot_tool_comparison(axes, stats: pd.DataFrame, datasets: List[str]):
                        alpha=0.35)
 
         ax.set_xticks(range(len(tools)))
-        ax.set_xticklabels(tools, fontsize=FONT_SIZES['tick'],
+        ax.set_xticklabels(tools,
                            fontweight='bold')
         n_seqs = ds_stats['total'].iloc[0]
         ax.set_title(f'{DATASET_LABELS.get(ds, ds)}\n(n = {n_seqs})',
@@ -328,15 +328,15 @@ def plot_nonviral_overlap(ax, hic_ids: set,
         if count > 0:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                     str(count), ha='center', va='bottom',
-                    fontsize=FONT_SIZES['bar_value'], fontweight='bold',
+                    fontsize=FONT_SIZES['overlay'], fontweight='bold',
                     color=COLORS['text'])
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=FONT_SIZES['tick_tiny'])
+    ax.set_xticklabels(labels)
     ax.set_ylabel('Sequences')
     ax.set_title(f'Non-viral classifications\n'
                  f'(HiC datasets, n = {len(hic_ids)})',
-                 fontweight='bold', pad=8)
+                 pad=8)
     ax.yaxis.grid(True, alpha=0.3, linestyle='--')
     ax.set_axisbelow(True)
 
@@ -412,11 +412,11 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
     # ---- Figure layout ----
     # Top row: [A: RefSeq] [B: 3× HiC]
     # Bottom row: [C: overlap] [D: 3× HiC filtered]
-    fig = plt.figure(figsize=(4.0 + 4.0 * n_hic, 10.0))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
     gs = gridspec.GridSpec(2, 2, figure=fig,
                            width_ratios=[1, n_hic],
-                           hspace=0.35, wspace=0.25,
-                           left=0.06, right=0.97, top=0.90, bottom=0.06)
+                           hspace=0.45, wspace=0.25,
+                           left=0.06, right=0.97, top=0.88, bottom=0.08)
 
     # Panel A: RefSeq
     ax_a = fig.add_subplot(gs[0, 0])
@@ -425,7 +425,7 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
         plot_tool_comparison([ax_a], stats_refseq, ['refseq'])
     else:
         ax_a.text(0.5, 0.5, 'No RefSeq data', transform=ax_a.transAxes,
-                  ha='center', va='center', fontsize=FONT_SIZES['fallback_msg'])
+                  ha='center', va='center')
         ax_a.set_axis_off()
     ax_a.set_ylabel('Fraction of sequences')
     ax_a.text(-0.15, 1.06, 'A', transform=ax_a.transAxes,
@@ -474,19 +474,11 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
     ]
     fig.legend(handles=legend_elements, loc='upper center',
                ncol=len(legend_elements), frameon=False,
-               fontsize=FONT_SIZES['legend'],
-               bbox_to_anchor=(0.5, 0.98))
+               bbox_to_anchor=(0.5, 0.97))
 
-    _suptitle(fig, 'Host prediction accuracy by taxonomic rank', y=1.02)
+    _suptitle(fig, 'Host prediction accuracy by taxonomic rank', y=1.04)
 
-    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', facecolor='white')
-    logger.info(f"Figure saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight', facecolor='white')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,11 @@ import numpy as np
 import torch
 
 from phagetransformer.model import CodonTokenizer
+from eval_utils import (
+    COLORS, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
+    setup_style, _save_figure, _output_path,
+    enable_presentation_mode,
+)
 from phagetransformer.predict import (
     read_fasta,
     load_model_and_calibration,
@@ -370,14 +375,16 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
 
+    setup_style()
+
     n = len(weight_matrices)
     if n == 0:
         logger.warning("No sequences to annotate.")
         return
 
     # Each genome gets 2 rows: gene track (thin) + heatmap
-    fig_height = max(3.0, 1.6 * n + 1.5)
-    fig, axes = plt.subplots(n, 1, figsize=(20, fig_height), squeeze=False,
+    fig_height = max(FIG_HEIGHT_ROW, 1.2 * n + 1.2)
+    fig, axes = plt.subplots(n, 1, figsize=(FIG_WIDTH, fig_height), squeeze=False,
                              gridspec_kw={'hspace': 0.55})
 
     # Shared color range across all genomes
@@ -385,8 +392,8 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
     vmax = max(w.max() for w in weight_matrices if w.size > 0)
 
     gene_colors = {
-        0: '#B22222', 1: '#B22222', 2: '#B22222',   # forward
-        3: '#FF8C00', 4: '#FF8C00', 5: '#FF8C00',   # reverse
+        0: COLORS['gene_fwd'], 1: COLORS['gene_fwd'], 2: COLORS['gene_fwd'],
+        3: COLORS['gene_rev'], 4: COLORS['gene_rev'], 5: COLORS['gene_rev'],
     }
     
     def nt_to_pos(nt_coord):
@@ -454,22 +461,23 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
                 ax.annotate(
                     label_text,
                     xy=(x_mid, fi), xytext=(x_mid, y_label),
-                    fontsize=6, ha='center', va=va, color='white',
-                    fontweight='bold', zorder=5,
-                    bbox=dict(boxstyle='round,pad=0.15', facecolor='#222',
+                    fontsize=FONT_SIZES['overlay_small'], ha='center', va=va,
+                    color='white', fontweight='bold', zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.15',
+                              facecolor=COLORS['dark_overlay'],
                               alpha=0.8, edgecolor='none'),
                     arrowprops=dict(arrowstyle='-', color='white',
                                     lw=0.5, alpha=0.6),
                 )
 
         ax.set_yticks(range(6))
-        ax.set_yticklabels(FRAME_LABELS, fontsize=8)
+        ax.set_yticklabels(FRAME_LABELS)
         ax.set_ylim(5.5, -0.5)
 
         # Truncate long IDs
         label = sid if len(sid) <= 40 else sid[:37] + '...'
-        ax.set_ylabel(label, fontsize=11, rotation=0, ha='right', va='center',
-                      labelpad=25)
+        ax.set_ylabel(label, rotation=0,
+                      ha='right', va='center', labelpad=25)
 
         # x-axis in kilobases
         n_ticks = min(8, max(2, n_pos // 20))
@@ -477,17 +485,19 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
         tick_labels_kb = [f'{nt / 1000:.1f}' for nt in
                           np.linspace(0, seq_len, n_ticks)]
         ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels_kb, fontsize=9)
+        ax.set_xticklabels(tick_labels_kb)
         if i == n - 1:
-            ax.set_xlabel('Genome position (kb)', fontsize=11)
+            ax.set_xlabel('Genome position (kb)')
 
         # Gene count annotation
         n_fwd = sum(1 for g in genes if g['strand'] == 1)
         n_rev = sum(1 for g in genes if g['strand'] == -1)
         ax.text(1.0, 1.0, f'{len(genes)} genes ({n_fwd}→ {n_rev}←)',
-                transform=ax.transAxes, fontsize=6, ha='right', va='bottom',
-                color='white', backgroundcolor='#333333',
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='#333333',
+                transform=ax.transAxes, fontsize=FONT_SIZES['overlay_small'],
+                ha='right', va='bottom', color='white',
+                backgroundcolor=COLORS['dark_overlay'],
+                bbox=dict(boxstyle='round,pad=0.2',
+                          facecolor=COLORS['dark_overlay'],
                           alpha=0.7, edgecolor='none'))
 
     # Shared colorbar
@@ -497,26 +507,21 @@ def plot_annotations(weight_matrices: list, seq_ids: list,
 
     # Legend for gene colors
     legend_patches = [
-        mpatches.Patch(facecolor='none', edgecolor=gene_colors[0],
+        mpatches.Patch(facecolor='none', edgecolor=COLORS['gene_fwd'],
                        linewidth=1.5, label='Forward genes'),
-        mpatches.Patch(facecolor='none', edgecolor=gene_colors[3],
+        mpatches.Patch(facecolor='none', edgecolor=COLORS['gene_rev'],
                        linewidth=1.5, label='Reverse genes'),
     ]
     fig.legend(handles=legend_patches, loc='lower right',
-               bbox_to_anchor=(0.96, 0.92), fontsize=11, frameon=True,
-               framealpha=0.9)
+               bbox_to_anchor=(0.96, 0.92),
+               frameon=True,
+               framealpha=0.9, edgecolor=COLORS['grid'])
 
-    fig.suptitle(title,
-                 fontsize=11, fontweight='bold', y=0.99)
+    fig.suptitle(title, fontsize=FONT_SIZES['title'],
+                 fontweight='bold', color=COLORS['text'], y=0.99)
 
-    fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
-    logger.info(f"Annotation plot saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
+    out_path = _output_path(out_path)
+    _save_figure(fig, out_path, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -565,11 +570,16 @@ def main():
                         help='Multiply in the aggregator\'s '
                              'patch-level pooling weights')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--presentation', action='store_true',
+                        help='Increase font sizes for presentations')
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
+
+    if args.presentation:
+        enable_presentation_mode()
 
     # ---- load model ------------------------------------------------------
     device = torch.device(args.device if torch.cuda.is_available()

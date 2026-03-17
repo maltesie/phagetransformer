@@ -36,9 +36,9 @@ from phagetransformer.dataset import (
     BacterialSequenceDataset, sequence_collate_fn,
 )
 from eval_utils import (
-    COLORS, LEVEL_NAMES, FONT_SIZES,
+    COLORS, LEVEL_NAMES, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
     setup_style, _add_panel_letters, _suptitle,
-    enable_presentation_mode,
+    _save_figure, enable_presentation_mode,
     collect_logits, parse_lineages, aggregate_to_level,
 )
 
@@ -334,7 +334,10 @@ def _compute_pr_curve(probs, labels, n_thresholds=200):
         tp_sum = tp.sum().item()
         fp_sum = fp.sum().item()
         fn_sum = fn.sum().item()
-        micro_p[ti] = tp_sum / max(tp_sum + fp_sum, 1e-12)
+        if tp_sum + fp_sum == 0:
+            micro_p[ti] = 1.0  # no predictions → precision is 1 by convention
+        else:
+            micro_p[ti] = tp_sum / (tp_sum + fp_sum)
         micro_r[ti] = tp_sum / max(tp_sum + fn_sum, 1e-12)
 
         per_p = tp / (tp + fp).clamp(min=1e-12)
@@ -378,10 +381,10 @@ def _violin_box(ax, data, labels_list, colors, ylabel, title):
         plt.setp(bp[element], color=COLORS['text_light'], linewidth=1)
 
     ax.set_xticks(positions)
-    ax.set_xticklabels(labels_list, fontsize=FONT_SIZES['tick'])
+    ax.set_xticklabels(labels_list)
     ax.set_ylabel(ylabel)
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(title, fontweight='bold', pad=8)
+    ax.set_title(title, pad=8)
     ax.yaxis.grid(True, alpha=0.3, linestyle='--')
     ax.set_axisbelow(True)
 
@@ -389,7 +392,7 @@ def _violin_box(ax, data, labels_list, colors, ylabel, title):
         if len(d) > 0:
             med = np.median(d)
             ax.text(i, med + 0.03, f'{med:.2f}', ha='center',
-                    fontsize=FONT_SIZES['bar_value'], color=COLORS['text'])
+                    fontsize=FONT_SIZES['overlay'], color=COLORS['text'])
 
 
 def plot_classification_violins(ax, genus_probs, genus_labels, hosts,
@@ -454,7 +457,7 @@ def plot_classification_pr(ax, genus_probs, genus_labels, hosts):
     ax.set_ylim(0, 1.02)
     ax.set_title('Classification macro PR\n(bacterial samples)',
                  fontweight='bold', pad=8)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower left',
+    ax.legend(loc='lower left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
 
@@ -506,7 +509,7 @@ def plot_chimera_sensitivity(ax, chimera_df, threshold):
     """
     if chimera_df.empty:
         ax.text(0.5, 0.5, 'No chimera data', transform=ax.transAxes,
-                ha='center', va='center', fontsize=FONT_SIZES['fallback_msg'])
+                ha='center', va='center')
         ax.set_axis_off()
         return
 
@@ -543,24 +546,9 @@ def plot_chimera_sensitivity(ax, chimera_df, threshold):
     ax.set_ylim(-0.02, 1.02)
     ax.set_title('Detection sensitivity\n(phage–bacteria chimeras)',
                  fontweight='bold', pad=8)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='upper left',
+    ax.legend(loc='upper left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
-
-
-# ---------------------------------------------------------------------------
-# Save helper
-# ---------------------------------------------------------------------------
-
-def _save_figure(fig, out_path: str, dpi: int = 200):
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight', facecolor='white')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -580,9 +568,9 @@ def make_bacteria_figure(genus_probs_cls, genus_labels_cls,
     """
     setup_style()
 
-    fig = plt.figure(figsize=(14, 12))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.35,
-                           left=0.08, right=0.96, top=0.93, bottom=0.06)
+                           left=0.08, right=0.96, top=0.93, bottom=0.07)
 
     ax_a = fig.add_subplot(gs[0, 0])
     plot_classification_violins(ax_a, genus_probs_cls, genus_labels_cls,

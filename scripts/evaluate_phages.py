@@ -27,26 +27,16 @@ from phagetransformer.dataset import (
     PatchSequenceDataset, sequence_collate_fn,
 )
 from eval_utils import (
-    COLORS, METRIC_COLORS, LEVEL_NAMES, FONT_SIZES, PRESENTATION_MODE,
+    COLORS, METRIC_COLORS, LEVEL_NAMES, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
+    PRESENTATION_MODE,
     setup_style, _add_panel_letters, _output_path, _suptitle,
-    enable_presentation_mode,
+    _save_figure, enable_presentation_mode,
     collect_logits, evaluate_all_levels, compute_real_support,
     parse_lineages, aggregate_to_level,
 )
 
 logger = logging.getLogger(__name__)
 
-
-def _save_figure(fig, out_path: str, dpi: int = 200):
-    """Save figure as PNG, PDF, and SVG."""
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight', facecolor='white')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Training history
@@ -97,7 +87,7 @@ def plot_loss_curves(ax, history: pd.DataFrame):
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Loss')
     ax.set_title('Training & validation loss')
-    ax.legend(fontsize=FONT_SIZES['legend_small'], ncol=2, loc='upper right')
+    ax.legend(ncol=2, loc='upper right')
 
 
 def plot_f1_curves(ax, history: pd.DataFrame):
@@ -116,7 +106,7 @@ def plot_f1_curves(ax, history: pd.DataFrame):
     ax.set_xlabel('Epoch')
     ax.set_ylabel('F1 score')
     ax.set_title('Validation F1')
-    ax.legend(fontsize=FONT_SIZES['legend_small'], ncol=2, loc='lower right')
+    ax.legend(ncol=2, loc='lower right')
 
 
 def plot_calibration(ax, logits: torch.Tensor, labels: torch.Tensor,
@@ -154,23 +144,23 @@ def plot_calibration(ax, logits: torch.Tensor, labels: torch.Tensor,
     ax2 = ax.twinx()
     ax2.bar(bin_centers, bin_count, width=1 / n_bins * 0.8,
             alpha=0.15, color=COLORS['quaternary'], zorder=0)
-    ax2.set_ylabel('Count', fontsize=FONT_SIZES['secondary_axis'],
+    ax2.set_ylabel('Count',
                    color=COLORS['text_light'])
-    ax2.tick_params(axis='y', labelsize=FONT_SIZES['secondary_axis'],
+    ax2.tick_params(axis='y',
                     colors=COLORS['text_light'])
     ax2.set_ylim(0, max(bin_count) * 4)
 
     weights = bin_count[valid] / bin_count[valid].sum()
     ece = (weights * np.abs(bin_acc[valid] - bin_conf[valid])).sum()
     ax.text(0.05, 0.92, f'ECE = {ece:.4f}', transform=ax.transAxes,
-            fontsize=FONT_SIZES['annotation'], color=COLORS['text'])
+            fontsize=FONT_SIZES['legend'], color=COLORS['text'])
 
     ax.set_xlabel('Predicted probability')
     ax.set_ylabel('Observed frequency')
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_title('Calibration')
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower right')
+    ax.legend(loc='lower right')
 
 
 def plot_taxonomic_metrics(ax, level_results: Dict[str, Dict]):
@@ -193,15 +183,15 @@ def plot_taxonomic_metrics(ax, level_results: Dict[str, Dict]):
                 ax.text(bar.get_x() + bar.get_width() / 2,
                         bar.get_height() + 0.008,
                         f'{val:.2f}', ha='center', va='bottom',
-                        fontsize=FONT_SIZES['bar_value'], color=COLORS['text_light'])
+                        fontsize=FONT_SIZES['overlay'], color=COLORS['text_light'])
 
     ax.set_xticks(x)
-    ax.set_xticklabels(levels, fontsize=FONT_SIZES['tick_small'])
+    ax.set_xticklabels(levels)
     ax.set_ylabel('Score')
     ax.set_ylim(0, 1.18)
     ax.set_yticks(np.arange(0, 1.01, 0.2))
     ax.set_title('Metrics by taxonomic rank')
-    ax.legend(fontsize=FONT_SIZES['legend_small'], ncol=4, loc='upper center',
+    ax.legend(ncol=4, loc='upper center',
               bbox_to_anchor=(0.5, 1.0))
 
 
@@ -242,7 +232,7 @@ def plot_f1_distribution(ax, level_results: Dict[str, Dict]):
                    color=colors_list[i], zorder=3, linewidths=0)
 
     ax.set_xticks(range(len(levels)))
-    ax.set_xticklabels(levels, fontsize=FONT_SIZES['tick_small'])
+    ax.set_xticklabels(levels)
     ax.set_ylabel('Per-category F1')
     ax.set_ylim(-0.05, 1.05)
     ax.set_title('F1 distribution per taxonomic rank')
@@ -292,7 +282,7 @@ def plot_support_vs_f1(ax, level_results: Dict[str, Dict],
         ax.plot(bin_centers, bin_medians, 'o-',
                 color=COLORS['secondary'], markersize=4, linewidth=1.5,
                 label='Median F1', zorder=4)
-        ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower right')
+        ax.legend(loc='lower right')
 
     ax.grid(alpha=0.3)
 
@@ -341,12 +331,12 @@ def _plot_distance_bar(ax, distance_values, has_prediction, is_correct,
     ax.bar(x, correct_ratios, color=COLORS['secondary'],
            label=f'Correct prediction (score \u2265 {pcut:.2f})')
     ax.set_xticks(x)
-    ax.set_xticklabels(bin_labels, fontsize=FONT_SIZES['tick_tiny'])
+    ax.set_xticklabels(bin_labels)
     ax.set_ylabel('Ratio of test genomes')
     ax.set_xlabel(xlabel)
     ax.set_ylim(0, 1.0)
     ax.set_title(title)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower right')
+    ax.legend(loc='lower right')
     ax.grid(alpha=0.3)
 
 
@@ -553,7 +543,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                        label=aa, zorder=3)
         for i, codon in enumerate(codons):
             ax.annotate(codon, (coords[i, 0], coords[i, 1]),
-                        fontsize=FONT_SIZES['codon'], ha='center', va='bottom',
+                        fontsize=FONT_SIZES['overlay_small'], ha='center', va='bottom',
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
 
@@ -566,7 +556,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                         edgecolors='white', linewidths=0.4, zorder=3)
         for i, codon in enumerate(codons):
             ax.annotate(codon, (coords[i, 0], coords[i, 1]),
-                        fontsize=FONT_SIZES['codon'], ha='center', va='bottom',
+                        fontsize=FONT_SIZES['overlay_small'], ha='center', va='bottom',
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
         return sc
@@ -599,7 +589,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
 
     # --- Layout: 1×3 (or 2×3 with MDS) ---
     nrows = 2 if show_mds else 1
-    fig = plt.figure(figsize=(22, 6.5 * nrows))
+    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT_ROW * nrows))
     gs = gridspec.GridSpec(nrows, 3, figure=fig, hspace=0.22,
                            wspace=0.38, left=0.06, right=0.97,
                            top=0.90, bottom=0.08 if show_mds else 0.10)
@@ -612,24 +602,39 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     bars = ax_summary.barh(y_pos, [abs(r) for r in best_rho],
                            color=bar_colors, edgecolor='white',
                            linewidth=0.5, height=0.7)
-    # Sign indicator: positive or negative correlation
+    # Property name inside bar, sign + stars outside
     for yi, (r, pv) in enumerate(zip(best_rho, best_pval)):
         sign = '+' if r > 0 else '−'
         stars = '***' if pv < 0.001 else ('**' if pv < 0.01
                                           else ('*' if pv < 0.05 else ''))
-        ax_summary.text(abs(r) + 0.01, yi,
-                        f'{sign} {prop_names[best_prop_idx[yi]]}{stars}',
-                        va='center', fontsize=FONT_SIZES['bar_label'],
-                        color=COLORS['text'])
+        bar_len = abs(r)
+        if bar_len >= 0.5:
+            # Label inside bar
+            ax_summary.text(bar_len - 0.01, yi,
+                            prop_names[best_prop_idx[yi]],
+                            va='center', ha='right',
+                            fontsize=FONT_SIZES['legend'],
+                            color='white', fontweight='bold')
+            # Sign + stars outside bar
+            ax_summary.text(bar_len + 0.01, yi,
+                            f'{sign}{stars}',
+                            va='center', ha='left',
+                            fontsize=FONT_SIZES['legend'],
+                            color=COLORS['text'])
+        else:
+            # Label outside bar (right side, black)
+            ax_summary.text(bar_len + 0.01, yi,
+                            f'{prop_names[best_prop_idx[yi]]} {sign}{stars}',
+                            va='center', ha='left',
+                            fontsize=FONT_SIZES['legend'],
+                            color=COLORS['text'], fontweight='bold')
     ax_summary.set_yticks(y_pos)
     ax_summary.set_yticklabels(
-        [f'PC{j+1} ({all_var[j]:.1%})' for j in range(n_summary_pcs)],
-        fontsize=FONT_SIZES['tick_small'])
+        [f'PC{j+1} ({all_var[j]:.1%})' for j in range(n_summary_pcs)])
     ax_summary.invert_yaxis()
-    ax_summary.set_xlabel('|Spearman ρ|', fontsize=FONT_SIZES['label'])
+    ax_summary.set_xlabel('|Spearman ρ|')
     ax_summary.set_xlim(0, 1.0)
-    ax_summary.set_title('Top correlated property per PC',
-                         fontsize=FONT_SIZES['title'], fontweight='bold')
+    ax_summary.set_title('Top correlated property per PC')
     ax_summary.grid(alpha=0.3, axis='x')
 
     # Mini legend for property groups (only groups actually present)
@@ -639,7 +644,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     grp_patches = [_Patch(facecolor=PROPERTY_GROUP_COLORS.get(g, '#999'), label=g)
                    for g in seen_groups]
     ax_summary.legend(handles=grp_patches,
-                      fontsize=FONT_SIZES['bar_label'], loc='lower right',
+                      loc='lower right',
                       frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
 
     # --- Panel B: PCA — amino acid ---
@@ -652,7 +657,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     ax_pca_aa.text(0.97, 0.97,
                    f'Silhouette = {sil:.3f} ({best_k} PCs)\np = {p_str}',
                    transform=ax_pca_aa.transAxes,
-                   fontsize=FONT_SIZES['annotation'], color=COLORS['text'],
+                   fontsize=FONT_SIZES['legend'], color=COLORS['text'],
                    va='top', ha='right')
 
     # --- Panel C: PCA — purine fraction ---
@@ -661,8 +666,12 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     ax_pca_pur.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
     ax_pca_pur.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
     ax_pca_pur.set_title('PCA — purine fraction')
-    cbar = fig.colorbar(sc, ax=ax_pca_pur, shrink=0.7, pad=0.02)
-    cbar.set_label('Purine fraction', fontsize=FONT_SIZES['colorbar'])
+    # Inset colorbar to avoid stealing width from the axes
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    cbar_ax = inset_axes(ax_pca_pur, width="4%", height="50%",
+                         loc='lower right', borderpad=1.5)
+    cbar = fig.colorbar(sc, cax=cbar_ax)
+    cbar.set_label('Purine frac.', fontsize=FONT_SIZES['legend'])
 
     all_axes = [ax_summary, ax_pca_aa, ax_pca_pur]
 
@@ -678,7 +687,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
         ax_mds_aa.set_title('MDS (cosine) — amino acid')
         ax_mds_aa.text(0.03, 0.97, f'Stress-1 = {stress:.3f}',
                        transform=ax_mds_aa.transAxes,
-                       fontsize=FONT_SIZES['annotation'],
+                       fontsize=FONT_SIZES['legend'],
                        color=COLORS['text'], va='top')
 
         ax_mds_pur = fig.add_subplot(gs[1, 2])
@@ -686,8 +695,10 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
         ax_mds_pur.set_xlabel('MDS dim 1')
         ax_mds_pur.set_ylabel('MDS dim 2')
         ax_mds_pur.set_title('MDS (cosine) — purine fraction')
-        fig.colorbar(sc_mds, ax=ax_mds_pur, shrink=0.7, pad=0.02).set_label(
-            'Purine fraction', fontsize=FONT_SIZES['colorbar'])
+        cbar_ax_mds = inset_axes(ax_mds_pur, width="4%", height="50%",
+                                 loc='lower right', borderpad=1.5)
+        fig.colorbar(sc_mds, cax=cbar_ax_mds).set_label(
+            'Purine frac.', fontsize=FONT_SIZES['legend'])
 
         all_axes += [ax_mds_aa, ax_mds_pur]
 
@@ -696,7 +707,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
 
     # Shared amino acid legend — right of panel B
     handles, labels = ax_pca_aa.get_legend_handles_labels()
-    fig.legend(handles, labels, fontsize=FONT_SIZES['legend_small'], ncol=1,
+    fig.legend(handles, labels, ncol=1,
                loc='center left',
                bbox_to_anchor=(0.67, 0.5 if not show_mds else 0.75),
                frameon=True, framealpha=0.9, edgecolor=COLORS['grid'],
@@ -1014,8 +1025,7 @@ def make_codon_property_correlation(model, out_path: str,
     names_ordered = [prop_names[i] for i in row_order]
 
     # --- Figure: variance bars on top + heatmap below ---
-    fig_height = max(6, n_props * 0.32 + 2.5)
-    fig = plt.figure(figsize=(max(12, n_pcs * 0.45 + 3), fig_height))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
     gs = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[1, 6],
                            hspace=0.05, left=0.22, right=0.92,
                            top=0.93, bottom=0.06)
@@ -1025,11 +1035,9 @@ def make_codon_property_correlation(model, out_path: str,
     ax_var.bar(range(n_pcs), var_explained * 100, color=COLORS['primary'],
                alpha=0.7, width=0.8, edgecolor='none')
     ax_var.set_xlim(-0.5, n_pcs - 0.5)
-    ax_var.set_ylabel('% var.', fontsize=FONT_SIZES['secondary_axis'])
+    ax_var.set_ylabel('% var.')
     ax_var.tick_params(axis='x', labelbottom=False)
-    ax_var.tick_params(axis='y', labelsize=FONT_SIZES['tick_tiny'])
-    ax_var.set_title('Codon properties vs. learned embedding PCs',
-                     fontsize=FONT_SIZES['title'], fontweight='bold', pad=8)
+    ax_var.set_title('Codon properties vs. learned embedding PCs', pad=8)
 
     # Heatmap (bottom)
     ax_heat = fig.add_subplot(gs[1])
@@ -1038,9 +1046,9 @@ def make_codon_property_correlation(model, out_path: str,
 
     ax_heat.set_xticks(range(n_pcs))
     ax_heat.set_xticklabels([f'PC{j+1}' for j in range(n_pcs)],
-                            fontsize=FONT_SIZES['bar_value'], rotation=90)
+                            rotation=90)
     ax_heat.set_yticks(range(n_props))
-    ax_heat.set_yticklabels(names_ordered, fontsize=FONT_SIZES['bar_label'])
+    ax_heat.set_yticklabels(names_ordered)
 
     # Color y-tick labels by group
     for yi, name in enumerate(names_ordered):
@@ -1064,19 +1072,19 @@ def make_codon_property_correlation(model, out_path: str,
     # Colorbar
     cbar_ax = fig.add_axes([0.935, 0.06, 0.012, 0.55])
     cb = fig.colorbar(im, cax=cbar_ax)
-    cb.set_label('Spearman \u03c1', fontsize=FONT_SIZES['colorbar'])
+    cb.set_label('Spearman \u03c1', fontsize=FONT_SIZES['legend'])
 
     # Legend
     from matplotlib.patches import Patch
     legend_patches = [Patch(facecolor=PROPERTY_GROUP_COLORS[g], label=g)
                       for g in PROPERTY_GROUP_COLORS]
-    fig.legend(handles=legend_patches, fontsize=FONT_SIZES['bar_label'],
+    fig.legend(handles=legend_patches,
                loc='lower left', bbox_to_anchor=(0.01, 0.01), ncol=3,
                frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
 
     _suptitle(fig,
         f'Spearman \u03c1  (* q<.05  ** q<.01  *** q<.001, BH-corrected)',
-        y=0.98, fontsize=FONT_SIZES['annotation'])
+        y=0.98, fontsize=FONT_SIZES['legend'])
 
     _save_figure(fig, out_path, dpi=dpi)
 
@@ -1127,7 +1135,7 @@ def plot_support_rank_curves(ax, level_results: Dict[str, Dict],
     ax.set_title('Host category support')
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='upper right')
+    ax.legend(loc='upper right')
     ax.grid(alpha=0.3)
 
 
@@ -1158,7 +1166,7 @@ def plot_top_genera(ax, level_results: Dict[str, Dict],
     ax.barh(y, top_sup, color=COLORS['primary'], edgecolor='white',
             linewidth=0.5, height=0.7)
     ax.set_yticks(y)
-    ax.set_yticklabels(top_names, fontsize=FONT_SIZES['legend_small'])
+    ax.set_yticklabels(top_names)
     ax.invert_yaxis()
     ax.set_xlabel('Support (genomes)')
     ax.set_title(f'Top {top_n} genera by support')
@@ -1166,7 +1174,7 @@ def plot_top_genera(ax, level_results: Dict[str, Dict],
     # Value labels
     for yi, val in zip(y, top_sup):
         ax.text(val + top_sup.max() * 0.01, yi, f'{val:.0f}',
-                va='center', fontsize=FONT_SIZES['tick_tiny'],
+                va='center', fontsize=FONT_SIZES['legend'],
                 color=COLORS['text_light'])
 
     ax.grid(alpha=0.3, axis='x')
@@ -1238,7 +1246,7 @@ def make_dataset_figure(level_results: Dict[str, Dict],
     """Support distributions, top genera, and unique proteins vs support."""
     setup_style()
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW))
 
     plot_support_rank_curves(ax1, level_results, real_support)
     plot_top_genera(ax2, level_results, real_support, top_n=20)
@@ -1249,7 +1257,6 @@ def make_dataset_figure(level_results: Dict[str, Dict],
     else:
         ax3.text(0.5, 0.5, 'No metadata available',
                  transform=ax3.transAxes, ha='center', va='center',
-                 fontsize=FONT_SIZES['fallback_msg'],
                  color=COLORS['text_light'])
         ax3.set_axis_off()
 
@@ -1274,7 +1281,7 @@ def make_training_figure(history: Optional[pd.DataFrame],
     has_history = history is not None and len(history) > 0
     ncols = 3 if has_history else 1
 
-    fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 5))
+    fig, axes = plt.subplots(1, ncols, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW))
     if ncols == 1:
         axes = [axes]
 
@@ -1311,9 +1318,9 @@ def make_evaluation_figure(level_results: Dict[str, Dict],
 
     has_distance = (metadata_df is not None and len(metadata_df) > 0)
 
-    fig = plt.figure(figsize=(16, 10))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32,
-                           left=0.06, right=0.97, top=0.93, bottom=0.07)
+                           left=0.07, right=0.97, top=0.93, bottom=0.07)
     ax_tax  = fig.add_subplot(gs[0, 0])
     ax_box  = fig.add_subplot(gs[0, 1])
     ax_sup  = fig.add_subplot(gs[1, 0])
@@ -1335,7 +1342,6 @@ def make_evaluation_figure(level_results: Dict[str, Dict],
     else:
         ax_ani.text(0.5, 0.5, 'No distance metadata available',
                     transform=ax_ani.transAxes, ha='center', va='center',
-                    fontsize=FONT_SIZES['fallback_msg'],
                     color=COLORS['text_light'])
         ax_ani.set_axis_off()
 
@@ -1416,7 +1422,10 @@ def _compute_pr_curve(probs, labels, n_thresholds=200):
         tp_sum = tp.sum().item()
         fp_sum = fp.sum().item()
         fn_sum = fn.sum().item()
-        micro_p[ti] = tp_sum / max(tp_sum + fp_sum, 1e-12)
+        if tp_sum + fp_sum == 0:
+            micro_p[ti] = 1.0  # no predictions → precision is 1 by convention
+        else:
+            micro_p[ti] = tp_sum / (tp_sum + fp_sum)
         micro_r[ti] = tp_sum / max(tp_sum + fn_sum, 1e-12)
 
         # Macro (only classes with support)
@@ -1468,8 +1477,8 @@ def _plot_pr_panel(ax, probs_per_level, labels_per_level, level_names,
     ax.set_ylabel('Precision')
     ax.set_xlim(0, 1.02)
     ax.set_ylim(0, 1.02)
-    ax.set_title(title, fontweight='bold', pad=8)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower left',
+    ax.set_title(title, pad=8)
+    ax.legend(loc='lower left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
     ax.set_aspect('equal')
@@ -1534,7 +1543,7 @@ def make_pr_figure(logits: torch.Tensor, labels: torch.Tensor,
 
     # --- Figure: 1×3 ---
     n_panels = 3 if has_blocked else 2
-    fig, axes = plt.subplots(1, n_panels, figsize=(6.5 * n_panels, 6),
+    fig, axes = plt.subplots(1, n_panels, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW),
                              squeeze=False)
     axes = axes[0]
 
