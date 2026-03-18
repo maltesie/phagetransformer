@@ -91,7 +91,8 @@ class BacterialGenomeStore:
     def __init__(self, host_genome_dir: str,
                  val_frac: float = 0.2,
                  seed: int = 42,
-                 one_per_genus: bool = False):
+                 one_per_genus: bool = False,
+                 genus_alpha: float = 0.25):
 
         manifest = os.path.join(host_genome_dir, 'host_genome_manifest.tsv')
         if not os.path.exists(manifest):
@@ -165,6 +166,28 @@ class BacterialGenomeStore:
                     f"~{val_frac:.0%} val (random cutout, seed={seed}, "
                     f"smallest val region: {min_val:,} nt)")
 
+        # Genus index for balanced sampling: P(genus) ∝ n_species^alpha
+        # alpha=0 → genus-uniform, alpha=1 → species-proportional (default)
+        from collections import defaultdict as _defaultdict
+        genus_to_species = _defaultdict(list)
+        for sp in self.species_list:
+            genus_to_species[sp.split()[0]].append(sp)
+        self.genus_to_species = dict(genus_to_species)
+        self.genus_list = sorted(self.genus_to_species.keys())
+        self.genus_alpha = genus_alpha
+
+        counts = np.array([len(self.genus_to_species[g])
+                           for g in self.genus_list], dtype=np.float64)
+        weights = counts ** genus_alpha
+        self.genus_weights = weights / weights.sum()
+
+        ratio = counts.max() ** genus_alpha / 1.0  # vs single-species genus
+        logger.info(f"  Genus sampling: {len(self.genus_list)} genera "
+                    f"(min {int(counts.min())}, median {int(np.median(counts))}, "
+                    f"max {int(counts.max())} species/genus), "
+                    f"alpha={genus_alpha}, "
+                    f"effective max/min ratio={ratio:.1f}x")
+
     def write_species_log(self, path: str):
         """Write a TSV listing all loaded species with genome lengths and split coords."""
         with open(path, 'w') as f:
@@ -215,9 +238,13 @@ class BacterialGenomeStore:
         Returns (subsequence, genus) where genus is the first word of
         the species name (e.g. 'Bacillus' from 'Bacillus subtilis').
         """
-        sp = self.species_list[np.random.randint(len(self.species_list))]
+        # Two-step sampling: pick genus by power-law weight, then species
+        # uniformly within the genus.
+        genus = self.genus_list[
+            np.random.choice(len(self.genus_list), p=self.genus_weights)]
+        species_in_genus = self.genus_to_species[genus]
+        sp = species_in_genus[np.random.randint(len(species_in_genus))]
         seq = self.genomes[sp]
-        genus = sp.split()[0]
 
         if split == 'val':
             region_start, region_end = self.splits[sp]['val']

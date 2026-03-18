@@ -453,6 +453,10 @@ def main():
                         'and aggregator phases)')
     g.add_argument('--one_genome_per_genus', action='store_true',
                    help='Keep only one genome per genus from the manifest')
+    g.add_argument('--genus_alpha', type=float, default=0.25,
+                   help='Power-law exponent for genus sampling balance. '
+                        '0=genus-uniform, 1=species-proportional, '
+                        'default 0.25 gives mild diversity bonus')
     g.add_argument('--encoder_checkpoint', type=str, default=None,
                    help='Pre-trained encoder checkpoint to load before '
                         'encoder phase (or to skip it with --encoder_epochs 0)')
@@ -516,8 +520,10 @@ def main():
         logger.info("Loading bacterial genomes …")
         genome_store = BacterialGenomeStore(
             args.host_genome_dir,
+            val_frac=0.0 if args.merge_val else 0.2,
             seed=args.seed,
             one_per_genus=args.one_genome_per_genus,
+            genus_alpha=args.genus_alpha,
         )
         genome_store.write_species_log(
             os.path.join(run_dir, 'logs', 'bacterial_species.tsv'))
@@ -854,7 +860,7 @@ def main():
         patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
         is_train=False, eval_stride=args.eval_stride,
     )
-    if use_bacteria:
+    if use_bacteria and not args.merge_val:
         n_bacteria_test = max(1, int(len(test_seqs)
                                      * args.aggregator_bacteria_ratio))
         bact_test_ds = BacterialSequenceDataset(
