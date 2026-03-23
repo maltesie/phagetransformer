@@ -92,22 +92,17 @@ If no prediction exceeds the threshold for a sequence, the single best predictio
 | `--input`, `-i` | *required* | Input FASTA file (plain or .gz) |
 | `--model_dir` | *required* | Model directory containing calibration.json and checkpoints/ |
 | `--output`, `-o` | stdout | Output TSV file |
-| `--threshold` | — | Fixed score threshold (highest priority) |
-| `--fdr` | — | Use FDR-calibrated threshold (e.g. `0.1` for 10% FDR) |
+| `--threshold` | — | Fixed score threshold (overrides --fdr) |
+| `--fdr` | 0.1 | FDR level for threshold from calibration (e.g. `0.1` for 10% FDR, `0.2` for 20%) |
 | `--bacterial_threshold` | 0.5 | Score threshold for the bacterial_fragment class |
 | `--filter_output` | off | Only report predictions above the host threshold and below the bacterial threshold |
 | `--top_k` | 0 | Max predictions per sequence (0 = all above threshold) |
 | `--batch_size` | 1 | Sequences per batch (1 saves memory) |
 | `--device` | cuda | Device (cuda or cpu) |
 
-#### Threshold priority
+#### Threshold
 
-The host prediction threshold is resolved in this order (highest to lowest priority):
-
-1. `--threshold` — explicit fixed value
-2. `--fdr` — FDR level from calibration (e.g. `--fdr 0.2` for 20% FDR)
-3. FDR 10% threshold from `calibration.json` (default if neither flag is given)
-4. Generic `threshold` field from `calibration.json` (fallback if no FDR thresholds were computed)
+By default, predictions are thresholded at the FDR 10% level from `calibration.json` (`--fdr 0.1`). Use `--fdr 0.2` for a more permissive 20% FDR, or `--threshold 0.3` to set an exact score cutoff (overrides `--fdr`).
 
 The tiling stride used during prediction is read from `calibration.json` (saved during training) to ensure consistency between training evaluation and inference.
 

@@ -13,11 +13,10 @@ Output columns:
     above_host_threshold     — 'yes' if score >= host threshold
     above_bacterial_threshold — 'yes' if bacterial_score >= bacterial threshold
 
-Host threshold priority (highest to lowest):
-    1. --threshold   (explicit fixed value)
-    2. --fdr         (FDR level from calibration, e.g. 0.1 for 10%)
-    3. FDR 10%       (default from calibration.json fdr_thresholds)
-    4. calibration.json 'threshold' field (fallback if no FDR thresholds)
+Host threshold:
+    --threshold sets a fixed score threshold.
+    --fdr (default 0.1) uses the FDR-calibrated threshold from calibration.json.
+    --threshold takes priority over --fdr when both are given.
 
 With --filter_output, only rows that are above the host threshold AND
 below the bacterial threshold are written — i.e., confident phage-host
@@ -299,12 +298,10 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--threshold', type=float, default=None,
-                        help='Fixed score threshold (highest priority, '
-                             'overrides --fdr and default)')
-    parser.add_argument('--fdr', type=float, default=None,
-                        help='Use FDR-calibrated threshold (e.g. 0.1 for '
-                             '10%% FDR). Default without --threshold or '
-                             '--fdr is FDR 10%%.')
+                        help='Fixed score threshold (overrides --fdr)')
+    parser.add_argument('--fdr', type=float, default=0.1,
+                        help='FDR level for threshold from calibration '
+                             '(e.g. 0.1 for 10%% FDR, 0.2 for 20%%)')
     parser.add_argument('--bacterial_threshold', type=float, default=0.5,
                         help='Score threshold for bacterial_fragment class')
     parser.add_argument('--filter_output', action='store_true',
@@ -336,13 +333,13 @@ def main():
     stride = calib.get('eval_stride') or patch_nt_len // 2
     top_k = args.top_k
 
-    # Resolve threshold: --threshold > --fdr > FDR 10% default
-    fdr_thresholds = calib.get('fdr_thresholds', {})
+    # Resolve threshold: --threshold overrides --fdr
     if args.threshold is not None:
         threshold = args.threshold
-        logger.info(f"Using user-specified threshold: {threshold:.4f}")
-    elif args.fdr is not None:
+        logger.info(f"Using fixed threshold: {threshold:.4f}")
+    else:
         fdr_key = f"fdr_{int(args.fdr * 100):02d}"
+        fdr_thresholds = calib.get('fdr_thresholds', {})
         if fdr_key in fdr_thresholds:
             threshold = fdr_thresholds[fdr_key]
             logger.info(f"Using FDR {args.fdr*100:.0f}% threshold: {threshold:.4f}")
@@ -351,13 +348,6 @@ def main():
             logger.error(f"FDR threshold '{fdr_key}' not found in calibration. "
                          f"Available: {available}")
             sys.exit(1)
-    elif 'fdr_10' in fdr_thresholds:
-        threshold = fdr_thresholds['fdr_10']
-        logger.info(f"Using default FDR 10% threshold: {threshold:.4f}")
-    else:
-        threshold = calib.get('threshold', 0.5)
-        logger.info(f"No FDR thresholds in calibration, using fallback "
-                    f"threshold: {threshold:.4f}")
 
     logger.info(f"Classes: {len(hosts)}  threshold: {threshold:.4f}  "
                 f"bacterial_threshold: {args.bacterial_threshold:.4f}  "
