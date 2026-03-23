@@ -256,7 +256,7 @@ def find_blocked_classes(logits, labels, temperature,
 
 def save_calibration(path, temperature, hosts, model_config,
                      threshold=0.5, fdr_thresholds=None,
-                     blocked_classes=None):
+                     blocked_classes=None, eval_stride=None):
     """Save calibration.json alongside checkpoints."""
     data = {
         'temperature': temperature,
@@ -264,6 +264,8 @@ def save_calibration(path, temperature, hosts, model_config,
         'hosts': hosts.tolist() if hasattr(hosts, 'tolist') else list(hosts),
         'model_config': model_config,
     }
+    if eval_stride is not None:
+        data['eval_stride'] = eval_stride
     if fdr_thresholds:
         data['fdr_thresholds'] = {
             f"fdr_{int(fdr*100):02d}": round(t, 5)
@@ -278,7 +280,7 @@ def save_calibration(path, temperature, hosts, model_config,
 
 def run_calibration(model, loader, device, unpack_fn, run_dir, hosts,
                     model_config, eval_threshold, min_val_precision,
-                    min_val_support):
+                    min_val_support, eval_stride=None):
     """Run temperature calibration, FDR thresholds, and class blocking."""
     T, logits, labels = calibrate_temperature(
         model, loader, device, unpack_fn)
@@ -292,5 +294,5 @@ def run_calibration(model, loader, device, unpack_fn, run_dir, hosts,
         os.path.join(run_dir, 'calibration.json'),
         temperature=T, hosts=hosts, model_config=model_config,
         threshold=eval_threshold, fdr_thresholds=fdr_thresholds,
-        blocked_classes=blocked,
+        blocked_classes=blocked, eval_stride=eval_stride,
     )

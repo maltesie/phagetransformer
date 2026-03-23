@@ -612,7 +612,8 @@ def main():
 
         run_calibration(model, val_loader, device, _unpack_sequence_batch,
                         run_dir, calib_hosts, model_config, args.eval_threshold,
-                        args.min_val_precision, args.min_val_support)
+                        args.min_val_precision, args.min_val_support,
+                        eval_stride=args.eval_stride)
         logger.info("Calibration complete.")
         return
 
@@ -819,6 +820,7 @@ def main():
             patch_nt_len=args.patch_nt_len,
             max_patches=args.max_patches,
             coverage=args.train_coverage, is_train=True,
+            scramble_rate=args.seq_scramble_rate,
         )
         combined_train_ds = ConcatDataset([train_seq_ds, bact_train_ds])
     else:
@@ -930,7 +932,8 @@ def main():
 
         run_calibration(model, seq_val_loader, device, _unpack_sequence_batch,
                         run_dir, hosts, model_config, args.eval_threshold,
-                        args.min_val_precision, args.min_val_support)
+                        args.min_val_precision, args.min_val_support,
+                        eval_stride=args.eval_stride)
     else:
         logger.info("\n--- Skipping calibration (--merge_val mode) ---")
         logger.info("  Copy calibration.json from your tuning run into this "

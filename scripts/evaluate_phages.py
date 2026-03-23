@@ -589,7 +589,7 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
 
     # --- Layout: 1×3 (or 2×3 with MDS) ---
     nrows = 2 if show_mds else 1
-    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT_ROW * nrows))
+    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT_ROW * nrows * 0.75))
     gs = gridspec.GridSpec(nrows, 3, figure=fig, hspace=0.22,
                            wspace=0.38, left=0.06, right=0.97,
                            top=0.90, bottom=0.08 if show_mds else 0.10)
@@ -1675,7 +1675,7 @@ def main():
 
     # ---- build val loader ------------------------------------------------
     tokenizer = CodonTokenizer()
-    eval_stride = args.eval_stride or patch_nt_len // 2
+    eval_stride = args.eval_stride or calib.get('eval_stride') or patch_nt_len // 2
     val_ds = PatchSequenceDataset(
         val_seqs, val_labels, tokenizer,
         patch_nt_len=patch_nt_len, max_patches=args.max_patches,

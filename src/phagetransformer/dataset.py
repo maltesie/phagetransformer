@@ -561,7 +561,7 @@ class BacterialSequenceDataset(Dataset):
                  n_samples, agg_num_classes, genus_to_idx: dict,
                  patch_nt_len=3072,
                  max_patches=512, coverage=2.0, is_train=True,
-                 eval_stride=None):
+                 eval_stride=None, scramble_rate=0.0):
         self.genome_store = genome_store
         self.tokenizer = tokenizer
         self.phage_lengths = phage_lengths
@@ -575,6 +575,8 @@ class BacterialSequenceDataset(Dataset):
         self.num_classes = agg_num_classes
         self.genus_to_idx = genus_to_idx
         self.bact_idx = agg_num_classes - 1
+        self.scramble_rate = scramble_rate
+        self.zero_label = np.zeros(agg_num_classes, dtype=np.float32)
 
     def __len__(self):
         return self.n_samples
@@ -608,10 +610,17 @@ class BacterialSequenceDataset(Dataset):
         seq, genus = self.genome_store.sample_subseq(
             self.split, target_len)
 
+        # Scramble augmentation: shuffle nucleotides, zero all labels
+        if self.scramble_rate > 0 and np.random.rand() <= self.scramble_rate:
+            chars = list(seq)
+            random.shuffle(chars)
+            seq = ''.join(chars)
+            label = self.zero_label
+        else:
+            label = self._make_label(genus)
+
         stride = self.train_stride if self.is_train else self.eval_stride
         patches = self._tile(seq, stride)
-
-        label = self._make_label(genus)
 
         toks = [self.tokenizer.tokenize(p) for p in patches]
         max_cl = max(t.size(1) for t in toks)

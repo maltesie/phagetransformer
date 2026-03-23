@@ -2,13 +2,35 @@
 """Inference script for the hierarchical DNA classifier.
 
 Loads a trained model checkpoint + calibration.json, processes FASTA input,
-and outputs per-sequence predictions as TSV.  Lineage information is
-extracted from the host names stored in calibration.json.
+and outputs per-sequence predictions as TSV.
+
+Output columns:
+    sequence_id              — FASTA record ID
+    genus                    — predicted host genus (last component of lineage)
+    lineage                  — full taxonomic lineage (Phylum;Class;Order;Family;Genus)
+    score                    — calibrated prediction score for this genus
+    bacterial_score          — score for the bacterial_fragment class (if present)
+    above_host_threshold     — 'yes' if score >= host threshold
+    above_bacterial_threshold — 'yes' if bacterial_score >= bacterial threshold
+
+Host threshold priority (highest to lowest):
+    1. --threshold   (explicit fixed value)
+    2. --fdr         (FDR level from calibration, e.g. 0.1 for 10%)
+    3. FDR 10%       (default from calibration.json fdr_thresholds)
+    4. calibration.json 'threshold' field (fallback if no FDR thresholds)
+
+With --filter_output, only rows that are above the host threshold AND
+below the bacterial threshold are written — i.e., confident phage-host
+predictions that are not flagged as bacterial.
 
 Usage:
-    python predict.py --input phages.fasta --model_dir ./models/PT
-    python predict.py --input phages.fna.gz --model_dir ./models/PT \
-        --fdr 0.1 --top_k 5
+    phagetransformer predict --input phages.fasta --model_dir ./models/PT
+    phagetransformer predict --input phages.fasta --model_dir ./models/PT \
+        --fdr 0.2 --top_k 5
+    phagetransformer predict --input phages.fasta --model_dir ./models/PT \
+        --threshold 0.3 --bacterial_threshold 0.4
+    phagetransformer predict --input phages.fasta --model_dir ./models/PT \
+        --filter_output
 
 Expected model_dir contents:
     calibration.json   — temperature, thresholds, model config, host list
@@ -22,7 +44,7 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -51,43 +73,6 @@ def read_fasta(path: str) -> List[dict]:
             })
     return records
 
-
-def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
-                   threshold: float, top_k: int) -> List[dict]:
-    """Format predictions for one sequence as list of output rows.
-
-    Returns only predictions above threshold, sorted by score descending.
-    If top_k > 0, caps output to top_k entries.
-    If nothing is above threshold, returns the single best prediction
-    (marked above_threshold=no).
-
-    The ``genus`` field contains the short genus name (last component
-    of the semicolon-separated lineage), and ``lineage`` contains the
-    full lineage string from calibration.json.
-    """
-    above = np.where(probs >= threshold)[0]
-
-    if len(above) == 0:
-        above = np.array([np.argmax(probs)])
-
-    above = above[np.argsort(probs[above])[::-1]]
-
-    if top_k > 0:
-        above = above[:top_k]
-
-    rows = []
-    for idx in above:
-        host = hosts[idx]
-        genus = host.split(';')[-1] if ';' in host else host
-        score = float(probs[idx])
-        rows.append({
-            'sequence_id': seq_id,
-            'genus': genus,
-            'lineage': host,
-            'score': f"{score:.4f}",
-            'above_threshold': 'yes' if score >= threshold else 'no',
-        })
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -238,24 +223,41 @@ def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
 
 
 def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
-                   threshold: float, top_k: int,
-                   taxonomy: Optional[Dict] = None,
-                   lineage_ranks: Optional[List[str]] = None) -> List[dict]:
+                   threshold: float, bacterial_threshold: float,
+                   top_k: int) -> List[dict]:
     """Format predictions for one sequence as list of output rows.
 
-    Returns only predictions above threshold, sorted by score descending.
-    If top_k > 0, caps output to top_k entries.
+    Returns only genus predictions above threshold, sorted by score
+    descending.  If top_k > 0, caps output to top_k entries.
     If nothing is above threshold, returns the single best prediction
-    (marked above_threshold=no).
+    (marked above_host_threshold=no).
+
+    The ``bacterial_fragment`` class (if present as the last host) is
+    reported separately as ``bacterial_score`` on every row, not as a
+    genus prediction.  ``above_bacterial_threshold`` indicates whether
+    the bacterial score exceeds ``bacterial_threshold``.
     """
-    above = np.where(probs >= threshold)[0]
+    # Separate bacterial_fragment from genus predictions
+    has_bact = len(hosts) > 0 and hosts[-1] == 'bacterial_fragment'
+    if has_bact:
+        bact_score = float(probs[-1])
+        above_bact = bact_score >= bacterial_threshold
+        genus_probs = probs[:-1]
+        genus_hosts = hosts[:-1]
+    else:
+        bact_score = None
+        above_bact = False
+        genus_probs = probs
+        genus_hosts = hosts
+
+    above = np.where(genus_probs >= threshold)[0]
 
     if len(above) == 0:
         # Nothing above threshold — return single best prediction
-        above = np.array([np.argmax(probs)])
+        above = np.array([np.argmax(genus_probs)])
 
     # Sort by score descending
-    above = above[np.argsort(probs[above])[::-1]]
+    above = above[np.argsort(genus_probs[above])[::-1]]
 
     # Cap if top_k requested
     if top_k > 0:
@@ -263,18 +265,18 @@ def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
 
     rows = []
     for idx in above:
-        genus = hosts[idx]
-        score = float(probs[idx])
+        host = genus_hosts[idx]
+        genus = host.split(';')[-1] if ';' in host else host
+        score = float(genus_probs[idx])
         row = {
             'sequence_id': seq_id,
             'genus': genus,
+            'lineage': host,
             'score': f"{score:.4f}",
-            'above_threshold': 'yes' if score >= threshold else 'no',
+            'bacterial_score': f"{bact_score:.4f}" if bact_score is not None else '',
+            'above_host_threshold': 'yes' if score >= threshold else 'no',
+            'above_bacterial_threshold': 'yes' if above_bact else 'no',
         }
-        if taxonomy and lineage_ranks:
-            lineage = taxonomy.get(genus, {})
-            parts = [lineage.get(r, '') for r in lineage_ranks]
-            row['lineage'] = ';'.join(parts)
         rows.append(row)
     return rows
 
@@ -297,14 +299,22 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Override checkpoint path')
     parser.add_argument('--threshold', type=float, default=None,
-                        help='Score threshold (default: from calibration.json)')
+                        help='Fixed score threshold (highest priority, '
+                             'overrides --fdr and default)')
     parser.add_argument('--fdr', type=float, default=None,
-                        help='Use FDR-calibrated threshold (e.g. 0.1 for 10%% FDR). '
-                             'Overrides --threshold.')
+                        help='Use FDR-calibrated threshold (e.g. 0.1 for '
+                             '10%% FDR). Default without --threshold or '
+                             '--fdr is FDR 10%%.')
+    parser.add_argument('--bacterial_threshold', type=float, default=0.5,
+                        help='Score threshold for bacterial_fragment class')
+    parser.add_argument('--filter_output', action='store_true',
+                        help='Only report predictions above the host '
+                             'threshold and below the bacterial threshold')
     parser.add_argument('--top_k', type=int, default=0,
                         help='Max predictions per sequence (0 = all above threshold)')
     parser.add_argument('--stride', type=int, default=None,
-                        help='Tiling stride in nt (default: patch_nt_len * 2/3)')
+                        help='Tiling stride in nt (default: from calibration.json, '
+                             'then patch_nt_len // 2)')
     parser.add_argument('--max_patches', type=int, default=512,
                         help='Max patches per sequence')
     parser.add_argument('--batch_size', type=int, default=1,
@@ -326,13 +336,16 @@ def main():
     temperature = calib['temperature']
     blocked_classes = calib.get('blocked_classes', [])
     patch_nt_len = calib['model_config']['patch_nt_len']
-    stride = args.stride or int(patch_nt_len * 2/3)
+    stride = args.stride or calib.get('eval_stride') or patch_nt_len // 2
     top_k = args.top_k
 
-    # Resolve threshold: --fdr > --threshold > calibration.json default
-    if args.fdr is not None:
+    # Resolve threshold: --threshold > --fdr > FDR 10% default
+    fdr_thresholds = calib.get('fdr_thresholds', {})
+    if args.threshold is not None:
+        threshold = args.threshold
+        logger.info(f"Using user-specified threshold: {threshold:.4f}")
+    elif args.fdr is not None:
         fdr_key = f"fdr_{int(args.fdr * 100):02d}"
-        fdr_thresholds = calib.get('fdr_thresholds', {})
         if fdr_key in fdr_thresholds:
             threshold = fdr_thresholds[fdr_key]
             logger.info(f"Using FDR {args.fdr*100:.0f}% threshold: {threshold:.4f}")
@@ -341,13 +354,20 @@ def main():
             logger.error(f"FDR threshold '{fdr_key}' not found in calibration. "
                          f"Available: {available}")
             sys.exit(1)
-    elif args.threshold is not None:
-        threshold = args.threshold
+    elif 'fdr_10' in fdr_thresholds:
+        threshold = fdr_thresholds['fdr_10']
+        logger.info(f"Using default FDR 10% threshold: {threshold:.4f}")
     else:
         threshold = calib.get('threshold', 0.5)
+        logger.info(f"No FDR thresholds in calibration, using fallback "
+                    f"threshold: {threshold:.4f}")
 
     logger.info(f"Classes: {len(hosts)}  threshold: {threshold:.4f}  "
+                f"bacterial_threshold: {args.bacterial_threshold:.4f}  "
                 f"patch_len: {patch_nt_len}  stride: {stride}")
+    if args.filter_output:
+        logger.info(f"  --filter_output: only reporting rows above host "
+                    f"threshold and below bacterial threshold")
     if blocked_classes:
         logger.info(f"  {len(blocked_classes)} blocked classes (low val precision)")
 
@@ -357,7 +377,9 @@ def main():
     logger.info(f"  {len(records)} sequences")
 
     # ---- prepare output --------------------------------------------------
-    fieldnames = ['sequence_id', 'genus', 'lineage', 'score', 'above_threshold']
+    fieldnames = ['sequence_id', 'genus', 'lineage', 'score',
+                  'bacterial_score', 'above_host_threshold',
+                  'above_bacterial_threshold']
 
     out_fh = open(args.output, 'w', newline='') if args.output else sys.stdout
     writer = csv.DictWriter(out_fh, fieldnames=fieldnames, delimiter='\t')
@@ -365,6 +387,17 @@ def main():
 
     # ---- predict ---------------------------------------------------------
     tokenizer = CodonTokenizer()
+    bact_thresh = args.bacterial_threshold
+    filter_out = args.filter_output
+
+    def _write_rows(rows):
+        for row in rows:
+            if filter_out:
+                if row['above_host_threshold'] != 'yes':
+                    continue
+                if row['above_bacterial_threshold'] == 'yes':
+                    continue
+            writer.writerow(row)
 
     if args.batch_size <= 1:
         for i, rec in enumerate(records):
@@ -372,9 +405,8 @@ def main():
                 model, tokenizer, rec['seq'], patch_nt_len, stride,
                 temperature, device, args.max_patches, blocked_classes)
             rows = format_results(
-                rec['id'], probs, hosts, threshold, top_k)
-            for row in rows:
-                writer.writerow(row)
+                rec['id'], probs, hosts, threshold, bact_thresh, top_k)
+            _write_rows(rows)
 
             if (i + 1) % 100 == 0:
                 logger.info(f"  processed {i+1}/{len(records)}")
@@ -387,9 +419,8 @@ def main():
                 temperature, device, args.max_patches, blocked_classes)
             for rec, probs in zip(batch_recs, all_probs):
                 rows = format_results(
-                    rec['id'], probs, hosts, threshold, top_k)
-                for row in rows:
-                    writer.writerow(row)
+                    rec['id'], probs, hosts, threshold, bact_thresh, top_k)
+                _write_rows(rows)
 
             done = min(start + args.batch_size, len(records))
             if done % 100 == 0 or done == len(records):

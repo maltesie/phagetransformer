@@ -412,7 +412,7 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
     # ---- Figure layout ----
     # Top row: [A: RefSeq] [B: 3× HiC]
     # Bottom row: [C: overlap] [D: 3× HiC filtered]
-    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW * 0.75))
     gs = gridspec.GridSpec(2, 2, figure=fig,
                            width_ratios=[1, n_hic],
                            hspace=0.45, wspace=0.25,
@@ -555,7 +555,7 @@ def main():
 
     # ---- load test data and run inference --------------------------------
     tokenizer = CodonTokenizer()
-    eval_stride = args.eval_stride or patch_nt_len // 2
+    eval_stride = args.eval_stride or calib.get('eval_stride') or patch_nt_len // 2
 
     logger.info("Loading external test set ...")
     cmp_ids, cmp_seqs, cmp_datasets, cmp_labels = load_test_with_ids(
