@@ -312,9 +312,6 @@ def main():
                              'threshold and below the bacterial threshold')
     parser.add_argument('--top_k', type=int, default=0,
                         help='Max predictions per sequence (0 = all above threshold)')
-    parser.add_argument('--stride', type=int, default=None,
-                        help='Tiling stride in nt (default: from calibration.json, '
-                             'then patch_nt_len // 2)')
     parser.add_argument('--max_patches', type=int, default=512,
                         help='Max patches per sequence')
     parser.add_argument('--batch_size', type=int, default=1,
@@ -336,7 +333,7 @@ def main():
     temperature = calib['temperature']
     blocked_classes = calib.get('blocked_classes', [])
     patch_nt_len = calib['model_config']['patch_nt_len']
-    stride = args.stride or calib.get('eval_stride') or patch_nt_len // 2
+    stride = calib.get('eval_stride') or patch_nt_len // 2
     top_k = args.top_k
 
     # Resolve threshold: --threshold > --fdr > FDR 10% default
