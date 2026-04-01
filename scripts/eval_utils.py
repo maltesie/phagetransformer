@@ -181,6 +181,10 @@ def load_test_with_ids(ts_path: str, hosts: np.ndarray
                                   np.ndarray]:
     """Load the external test set preserving sequence IDs and dataset labels.
 
+    Reads ``merged.fna.gz`` and ``merged_lineage.csv``.  Sequences whose
+    ``gtdb_forwarded_lineage`` is missing or does not reach genus rank
+    (no ``g__``) are excluded.
+
     Returns
     -------
     seq_ids  : list of FASTA record IDs
@@ -188,26 +192,53 @@ def load_test_with_ids(ts_path: str, hosts: np.ndarray
     datasets : list of dataset labels (cow_fecal, human_gut, …)
     labels   : (N, C) multi-hot label matrix
     """
-    fasta_path = os.path.join(ts_path, 'combined.fna.gz')
-    csv_path = os.path.join(ts_path, 'combined_lineage.csv')
+    fasta_path = os.path.join(ts_path, 'merged.fna.gz')
+    csv_path = os.path.join(ts_path, 'merged_lineage.csv')
 
-    seq_ids, seqs = [], []
+    # Read FASTA into a dict for fast lookup
+    fasta_dict = {}
     with gzip.open(fasta_path, 'rt') as fh:
         for rec in SeqIO.parse(fh, 'fasta'):
-            seq_ids.append(rec.id)
-            seqs.append(str(rec.seq))
+            fasta_dict[rec.id] = str(rec.seq)
 
     df = pd.read_csv(csv_path, delimiter=',', dtype=str)
 
-    genus_index = {x: i for i, x in enumerate(hosts)}
-    labels = np.zeros((len(df), len(genus_index)), dtype=np.float32)
-    for i, hs in enumerate(df['host_genus_lineage']):
-        for h in hs.split('|'):
-            h_trunc = ';'.join(h.split(';')[1:])
-            if h_trunc in genus_index:
-                labels[i, genus_index[h_trunc]] = 1
+    # Filter: keep only rows with genus-level GTDB lineage
+    has_genus = df['gtdb_forwarded_lineage'].str.contains('g__', na=False)
+    n_dropped = (~has_genus).sum()
+    df = df[has_genus].reset_index(drop=True)
+    if n_dropped:
+        logger.info(f"  Dropped {n_dropped} sequences without genus-level "
+                    f"lineage ({len(df)} remaining)")
 
-    datasets = df['dataset'].tolist()
+    # Build genus lookup: hosts entries are "Phylum;Class;Order;Family;Genus"
+    genus_index = {x: i for i, x in enumerate(hosts)}
+    # Also index by bare genus name (last component)
+    genus_name_index = {}
+    for x, i in genus_index.items():
+        name = x.split(';')[-1] if ';' in x else x
+        genus_name_index[name] = i
+
+    # Align FASTA to CSV order, keeping only sequences present in both
+    seq_ids, seqs, datasets = [], [], []
+    labels = np.zeros((len(df), len(hosts)), dtype=np.float32)
+    kept = 0
+    for idx, row in df.iterrows():
+        sid = row['seq_id']
+        if sid not in fasta_dict:
+            continue
+        seq_ids.append(sid)
+        seqs.append(fasta_dict[sid])
+        datasets.append(row['dataset'])
+
+        # Multi-hot labels from host_genus (pipe-separated)
+        for g in str(row['host_genus']).split('|'):
+            g = g.strip()
+            if g in genus_name_index:
+                labels[kept, genus_name_index[g]] = 1
+        kept += 1
+
+    labels = labels[:kept]
     return seq_ids, seqs, datasets, labels
 
 

@@ -49,10 +49,12 @@ DATASET_LABELS = {
     'cow_fecal':    'Cow fecal',
     'human_gut':    'Human gut',
     'waste_water':  'Waste water',
-    'refseq':       'RefSeq',
+    'genbank':      'GenBank',
+    'subset':       'Subset',
 }
 
 HIC_DATASETS = ['cow_fecal', 'human_gut', 'waste_water']
+DB_DATASETS  = ['genbank', 'subset']
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,25 @@ def _parse_lineage_gtdb(lin: str) -> List[Optional[str]]:
             for i in range(1, 6)]
 
 
+def _parse_lineage_gtdb_multi(lin: str) -> List[Optional[str]]:
+    """Parse a pipe-separated multi-host GTDB lineage string.
+
+    Returns a list of 5 elements (Phylum through Genus).  When multiple
+    hosts are present, the values at each rank are pipe-joined
+    (e.g. ``"Bacillota|Pseudomonadota"``).  Duplicates within a rank
+    are collapsed.
+    """
+    if pd.isna(lin) or lin == '':
+        return [None] * 5
+    host_lineages = lin.split('|')
+    parsed = [_parse_lineage_gtdb(h) for h in host_lineages]
+    result = []
+    for rank_idx in range(5):
+        vals = {p[rank_idx] for p in parsed if p[rank_idx] is not None}
+        result.append('|'.join(sorted(vals)) if vals else None)
+    return result
+
+
 def _parse_lineage_pt(lin: str) -> List[Optional[str]]:
     if pd.isna(lin) or lin == '':
         return [None] * 5
@@ -92,26 +113,39 @@ def load_comparison_data(compare_dir: str, pt_predictions: pd.DataFrame,
                          pt_threshold: float):
     """Load all prediction data and return merged DataFrames per tool.
 
+    Reads ``merged_lineage.csv`` (target labels with GTDB lineage),
+    iPHoP results (``Host_prediction_to_genus_m90_forward.csv``), and
+    CHERRY results (``cherry_prediction_stripped_translated_genus.tsv``).
+
+    Sequences whose ``gtdb_forwarded_lineage`` is missing or does not
+    reach genus rank are excluded up front.
+
     Returns (target, iphop_m, pt_m, cherry_m, datasets) where *_m are
     left-joined onto target.
     """
-    target = pd.read_csv(os.path.join(compare_dir, 'target_lineages.csv'))
+    target = pd.read_csv(os.path.join(compare_dir, 'merged_lineage.csv'))
     iphop  = pd.read_csv(os.path.join(compare_dir,
-                                       'iphop_predictions_gtdb226.csv'))
+                                       'Host_prediction_to_genus_m90_forward.csv'))
     cherry = pd.read_csv(os.path.join(compare_dir,
-                                       'cherry_final_prediction_gtdb.csv'))
+                                       'cherry_prediction_stripped_translated_genus.tsv'))
 
-    # Exclusion: remove sequences where iPHoP predicts to genus level
-    has_genus = iphop['host_genus_lineage'].str.contains('g__', na=False)
-    excluded_ids = set(iphop.loc[has_genus, 'Virus'])
-    logger.info(f"  Excluding {len(excluded_ids)} sequences "
-                f"(iPHoP genus-level)")
+    # Filter target: keep only rows with genus-level GTDB lineage
+    has_genus = target['gtdb_forwarded_lineage'].str.contains('g__', na=False)
+    n_dropped = (~has_genus).sum()
+    target = target[has_genus].reset_index(drop=True)
+    if n_dropped:
+        logger.info(f"  Dropped {n_dropped} target sequences without "
+                    f"genus-level lineage ({len(target)} remaining)")
 
-    iphop = iphop[~iphop['Virus'].isin(excluded_ids)].copy()
-    cherry = cherry[~cherry['contig_name'].isin(excluded_ids)].copy()
-    target = target[~target['Phage'].isin(excluded_ids)].copy()
+    # Rename seq_id → Phage for downstream compatibility
+    target = target.rename(columns={'seq_id': 'Phage'})
 
-    pt = pt_predictions[~pt_predictions['sequence_id'].isin(excluded_ids)].copy()
+    # Keep only sequences present in target
+    keep_ids = set(target['Phage'])
+    iphop  = iphop[iphop['Virus'].isin(keep_ids)].copy()
+    cherry = cherry[cherry['Accession'].isin(keep_ids)].copy()
+    pt = pt_predictions[pt_predictions['sequence_id'].isin(keep_ids)].copy()
+
     has_bact_col = 'is_bacterial' in pt.columns
     if has_bact_col:
         pt = pt[(pt['score'] > pt_threshold) | pt['is_bacterial']]
@@ -122,13 +156,13 @@ def load_comparison_data(compare_dir: str, pt_predictions: pd.DataFrame,
 
     # Parse lineages
     for i, lvl in enumerate(LEVEL_NAMES):
-        target[f'true_{lvl}'] = target['host_genus_lineage'].apply(
-            lambda x, _i=i: _parse_lineage_target(x)[_i])
-        iphop[f'pred_{lvl}'] = iphop['host_genus_lineage'].apply(
+        target[f'true_{lvl}'] = target['gtdb_forwarded_lineage'].apply(
+            lambda x, _i=i: _parse_lineage_gtdb_multi(x)[_i])
+        iphop[f'pred_{lvl}'] = iphop['gtdb_forwarded'].apply(
             lambda x, _i=i: _parse_lineage_gtdb(x)[_i])
         pt[f'pred_{lvl}'] = pt['genus'].apply(
             lambda x, _i=i: _parse_lineage_pt(x)[_i])
-        cherry[f'pred_{lvl}'] = cherry['Top_1_label_lineage'].apply(
+        cherry[f'pred_{lvl}'] = cherry['host_genus'].apply(
             lambda x, _i=i: _parse_lineage_gtdb(x)[_i])
 
     # Merge onto target
@@ -149,10 +183,10 @@ def load_comparison_data(compare_dir: str, pt_predictions: pd.DataFrame,
         pt_m['is_bacterial'] = pt_m['is_bacterial'].fillna(False)
 
     cherry_m = target[true_cols].merge(
-        cherry[pred_cols('contig_name')],
-        left_on='Phage', right_on='contig_name', how='left')
+        cherry[pred_cols('Accession')],
+        left_on='Phage', right_on='Accession', how='left')
 
-    datasets = [ds for ds in ['cow_fecal', 'human_gut', 'waste_water', 'refseq']
+    datasets = [ds for ds in HIC_DATASETS + DB_DATASETS
                 if ds in target['dataset'].values]
 
     return target, iphop_m, pt_m, cherry_m, datasets
@@ -205,8 +239,52 @@ def load_quality_data(compare_dir: str):
 # Stats computation
 # ---------------------------------------------------------------------------
 
+def _any_match(pred_series, true_series):
+    """Check if prediction matches any of the pipe-separated true values."""
+    def _check(pred, true):
+        if pd.isna(pred) or pd.isna(true):
+            return False
+        return pred in true.split('|')
+    return pd.Series(
+        [_check(p, t) for p, t in zip(pred_series, true_series)],
+        index=pred_series.index)
+
+
+def _count_correct_genera(merged_df, dataset: str) -> int:
+    """Count unique genera correctly predicted at least once in a dataset.
+
+    For multi-host targets (pipe-separated true values), each individual
+    genus is counted separately.
+    """
+    sub = merged_df[merged_df['dataset'] == dataset]
+    correct_genera = set()
+    for _, row in sub.iterrows():
+        pred = row.get('pred_Genus')
+        true = row.get('true_Genus')
+        if pd.isna(pred) or pd.isna(true):
+            continue
+        for g in true.split('|'):
+            if pred == g:
+                correct_genera.add(g)
+    return len(correct_genera)
+
+
+def compute_genus_counts(iphop_m, pt_m, cherry_m, dataset: str) -> dict:
+    """Return {tool_name: n_correct_genera} for a dataset."""
+    return {
+        'iPHoP':  _count_correct_genera(iphop_m, dataset),
+        'PT':     _count_correct_genera(pt_m, dataset),
+        'CHERRY': _count_correct_genera(cherry_m, dataset),
+    }
+
+
+
 def compute_stats(iphop_m, pt_m, cherry_m, datasets):
-    """Compute per-dataset, per-rank any-match accuracy for all tools."""
+    """Compute per-dataset, per-rank any-match accuracy for all tools.
+
+    For multi-host targets (pipe-separated true values), a prediction
+    is correct if it matches any of the true values at that rank.
+    """
     tools_data = [('iPHoP', iphop_m), ('PT', pt_m), ('CHERRY', cherry_m)]
     rows = []
     for tool_name, merged_df in tools_data:
@@ -218,7 +296,7 @@ def compute_stats(iphop_m, pt_m, cherry_m, datasets):
                     lambda s: s.notna().any())
                 has_pred = int(has_pred_per_seq.sum())
 
-                match = sub[f'pred_{lvl}'] == sub[f'true_{lvl}']
+                match = _any_match(sub[f'pred_{lvl}'], sub[f'true_{lvl}'])
                 correct_per_seq = match.groupby(sub['Phage']).any()
                 correct = int(correct_per_seq.sum())
 
@@ -351,12 +429,11 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
                            dpi: int = 200):
     """Four-panel comparison figure.
 
-    A (top-left):     RefSeq unfiltered
-    B (top-right):    HiC datasets unfiltered
+    A (top-left):     GenBank + Subset (2 sub-panels)
+    B (top-right):    HiC datasets unfiltered (3 sub-panels)
     C (bottom-left):  Non-viral counts (geNomad, CheckV, PT — individual,
                       pairwise, and union)
-    D (bottom-right): HiC datasets filtered (consensus non-viral removed —
-                      sequences all three tools agree are non-viral)
+    D (bottom-right): HiC datasets filtered (consensus non-viral removed)
     """
     from matplotlib.patches import Patch
     setup_style()
@@ -366,8 +443,9 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
         compare_dir, pt_predictions, pt_threshold)
 
     hic_ds = [ds for ds in HIC_DATASETS if ds in datasets]
-    has_refseq = 'refseq' in datasets
+    db_ds  = [ds for ds in DB_DATASETS  if ds in datasets]
     n_hic = len(hic_ds)
+    n_db  = len(db_ds)
 
     # Compute stats for all datasets (unfiltered)
     stats_all = compute_stats(iphop_m, pt_m, cherry_m, datasets)
@@ -410,27 +488,58 @@ def make_comparison_figure(compare_dir: str, pt_predictions: pd.DataFrame,
     log_stats(stats_filt, 'Filtered (excl. consensus non-viral)')
 
     # ---- Figure layout ----
-    # Top row: [A: RefSeq] [B: 3× HiC]
-    # Bottom row: [C: overlap] [D: 3× HiC filtered]
+    # Top row:    [A: n_db × database panels] [B: n_hic × HiC]
+    # Bottom row: [C: non-viral overlap]      [D: n_hic × HiC filtered]
     fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW * 0.75))
     gs = gridspec.GridSpec(2, 2, figure=fig,
-                           width_ratios=[1, n_hic],
+                           width_ratios=[max(n_db, 1), n_hic],
                            hspace=0.45, wspace=0.25,
                            left=0.06, right=0.97, top=0.88, bottom=0.08)
 
-    # Panel A: RefSeq
-    ax_a = fig.add_subplot(gs[0, 0])
-    if has_refseq:
-        stats_refseq = stats_all[stats_all['dataset'] == 'refseq']
-        plot_tool_comparison([ax_a], stats_refseq, ['refseq'])
+    # Panel A: GenBank + Subset
+    if n_db > 0:
+        gs_a = gs[0, 0].subgridspec(1, n_db, wspace=0.08)
+        axes_a = [fig.add_subplot(gs_a[0, i]) for i in range(n_db)]
+        stats_db = stats_all[stats_all['dataset'].isin(db_ds)]
+        plot_tool_comparison(axes_a, stats_db, db_ds)
+
+        # Overlay genus counts on subset panel
+        if 'subset' in db_ds:
+            subset_idx = db_ds.index('subset')
+            ax_subset = axes_a[subset_idx]
+            genus_counts = compute_genus_counts(
+                iphop_m, pt_m, cherry_m, 'subset')
+            # Count total unique true genera in subset
+            subset_target = target[target['dataset'] == 'subset']
+            all_true_genera = set()
+            for lin in subset_target['true_Genus'].dropna():
+                all_true_genera.update(lin.split('|'))
+            n_total_genera = len(all_true_genera)
+            tools = ['iPHoP', 'PT', 'CHERRY']
+            subset_stats = stats_db[stats_db['dataset'] == 'subset']
+            for t_idx, tool in enumerate(tools):
+                ts = subset_stats[subset_stats['tool'] == tool]
+                # Bar stack height = ratio_correct + ratio_wrong
+                max_height = (ts['ratio_correct'] + ts['ratio_wrong']).max()
+                n_genera = genus_counts[tool]
+                ax_subset.text(t_idx, max_height + 0.02,
+                               f'{n_genera}/{n_total_genera}',
+                               ha='center', va='bottom',
+                               fontsize=FONT_SIZES['overlay'],
+                               fontweight='bold',
+                               color=COLORS['text'])
+        for i, ax in enumerate(axes_a):
+            if i > 0:
+                ax.set_yticklabels([])
+        axes_a[0].set_ylabel('Fraction of sequences')
+        axes_a[0].text(-0.25, 1.06, 'A', transform=axes_a[0].transAxes,
+                       fontsize=FONT_SIZES['panel_letter'], fontweight='bold',
+                       color=COLORS['text'], va='top')
     else:
-        ax_a.text(0.5, 0.5, 'No RefSeq data', transform=ax_a.transAxes,
+        ax_a = fig.add_subplot(gs[0, 0])
+        ax_a.text(0.5, 0.5, 'No database data', transform=ax_a.transAxes,
                   ha='center', va='center')
         ax_a.set_axis_off()
-    ax_a.set_ylabel('Fraction of sequences')
-    ax_a.text(-0.15, 1.06, 'A', transform=ax_a.transAxes,
-              fontsize=FONT_SIZES['panel_letter'], fontweight='bold',
-              color=COLORS['text'], va='top')
 
     # Panel B: HiC unfiltered
     gs_b = gs[0, 1].subgridspec(1, n_hic, wspace=0.08)
@@ -496,11 +605,11 @@ def main():
                              'and checkpoints/)')
     parser.add_argument('--compare_dir', type=str, required=True,
                         help='Directory with tool comparison CSVs '
-                             '(target_lineages.csv, iPHoP, CHERRY, '
+                             '(merged_lineage.csv, iPHoP, CHERRY, '
                              'geNomad, CheckV results)')
     parser.add_argument('--testset_dir', type=str, required=True,
-                        help='Directory with combined.fna.gz and '
-                             'combined_lineage.csv')
+                        help='Directory with merged.fna.gz and '
+                             'merged_lineage.csv')
     parser.add_argument('--output', '-o', type=str, default='comparison.png',
                         help='Output filename')
     parser.add_argument('--checkpoint', type=str, default=None,
