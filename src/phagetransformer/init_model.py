@@ -28,13 +28,13 @@ DEFAULT_MODEL_DIR = os.path.join(
 MODEL_FILES = [
     {
         'filename': 'checkpoints/best_aggregator.pt',
-        'url': 'https://github.com/yourname/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
         'sha256': '25d0e80ab40a844b8ae7e9f0c526475324fdcc557ed41b5466c441627997e149',
         'size_mb': 80,
     },
     {
         'filename': 'calibration.json',
-        'url': 'https://github.com/yourname/phagetransformer/releases/download/v0.1.0/calibration.json',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/calibration.json',
         'sha256': 'be425198dbade9ac7e72c809934bdfd586047d406283ffe14ba96ca740602720',
         'size_mb': 0.01,
     },
@@ -63,12 +63,12 @@ def _download(url: str, dest: str, expected_sha256: str = None,
     else:
         logger.info(f"  Downloading {os.path.basename(dest)} …")
 
+    tmp = dest + '.part'
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'PhageTransformer'})
         with urllib.request.urlopen(req) as resp:
             total = int(resp.headers.get('Content-Length', 0))
             downloaded = 0
-            tmp = dest + '.part'
             with open(tmp, 'wb') as f:
                 while True:
                     chunk = resp.read(1 << 20)  # 1 MB
