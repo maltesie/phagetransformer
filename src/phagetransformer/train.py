@@ -209,6 +209,57 @@ def evaluate(model, loader, criterion, device, threshold, tag, unpack_fn,
 
 
 # ---------------------------------------------------------------------------
+# Optimizer parameter grouping
+# ---------------------------------------------------------------------------
+
+def build_param_groups(model: nn.Module, weight_decay: float):
+    """Split trainable params into weight-decay and no-decay groups.
+
+    Matrix-like parameters (Linear/Conv weights) are decayed; everything else
+    is excluded from weight decay.  The no-decay set covers biases,
+    LayerNorm/BatchNorm affine params, the learnable attention query
+    parameters, and embedding tables.
+
+    Two subtleties the routing handles explicitly:
+
+    * The query parameters are declared with shape ``(1, 1, dim)``, so a plain
+      ``ndim`` test would misclassify them as matrices.  We route on
+      *effective* dimensionality — axes with size > 1 — so a ``(1, 1, dim)``
+      query counts as a vector and is excluded from decay.
+    * Embedding tables are 2-D ``(vocab, dim)`` and are shape-indistinguishable
+      from Linear weights, so they are identified by module type and forced
+      into the no-decay group.
+    """
+    # Parameter ids belonging to nn.Embedding modules — excluded from decay.
+    embedding_param_ids = {
+        id(p)
+        for m in model.modules() if isinstance(m, nn.Embedding)
+        for p in m.parameters(recurse=False)
+    }
+
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        effective_ndim = sum(1 for s in p.shape if s > 1)
+        if effective_ndim >= 2 and id(p) not in embedding_param_ids:
+            decay.append(p)
+        else:
+            no_decay.append(p)
+
+    n_decay = sum(p.numel() for p in decay)
+    n_no_decay = sum(p.numel() for p in no_decay)
+    logger.info(f"  param groups: decay={len(decay)} tensors "
+                f"({n_decay:,} params), "
+                f"no_decay={len(no_decay)} tensors ({n_no_decay:,} params)")
+
+    return [
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Phase runner
 # ---------------------------------------------------------------------------
 
@@ -253,11 +304,11 @@ def run_phase(
     logger.info(f"  {phase_name}  ({num_epochs} epochs, lr={learning_rate:.1e})")
     logger.info(f"{'='*60}")
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    trainable = sum(p.numel() for p in params)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"  trainable parameters: {trainable:,}")
 
-    optimizer = torch.optim.AdamW(params, lr=learning_rate,
+    param_groups = build_param_groups(model, weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=learning_rate,
                                   weight_decay=weight_decay)
 
     total_steps = len(train_loader) * num_epochs // grad_accum
