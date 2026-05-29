@@ -5,10 +5,110 @@ import logging
 import math
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Biologically-informed codon embedding initialization
+# ---------------------------------------------------------------------------
+
+_BASES = 'ACGT'
+_CODONS = [a + b + c for a in _BASES for b in _BASES for c in _BASES]
+
+_GENETIC_CODE = {
+    'AAA': 'K', 'AAC': 'N', 'AAG': 'K', 'AAT': 'N',
+    'ACA': 'T', 'ACC': 'T', 'ACG': 'T', 'ACT': 'T',
+    'AGA': 'R', 'AGC': 'S', 'AGG': 'R', 'AGT': 'S',
+    'ATA': 'I', 'ATC': 'I', 'ATG': 'M', 'ATT': 'I',
+    'CAA': 'Q', 'CAC': 'H', 'CAG': 'Q', 'CAT': 'H',
+    'CCA': 'P', 'CCC': 'P', 'CCG': 'P', 'CCT': 'P',
+    'CGA': 'R', 'CGC': 'R', 'CGG': 'R', 'CGT': 'R',
+    'CTA': 'L', 'CTC': 'L', 'CTG': 'L', 'CTT': 'L',
+    'GAA': 'E', 'GAC': 'D', 'GAG': 'E', 'GAT': 'D',
+    'GCA': 'A', 'GCC': 'A', 'GCG': 'A', 'GCT': 'A',
+    'GGA': 'G', 'GGC': 'G', 'GGG': 'G', 'GGT': 'G',
+    'GTA': 'V', 'GTC': 'V', 'GTG': 'V', 'GTT': 'V',
+    'TAA': '*', 'TAC': 'Y', 'TAG': '*', 'TAT': 'Y',
+    'TCA': 'S', 'TCC': 'S', 'TCG': 'S', 'TCT': 'S',
+    'TGA': '*', 'TGC': 'C', 'TGG': 'W', 'TGT': 'C',
+    'TTA': 'L', 'TTC': 'F', 'TTG': 'L', 'TTT': 'F',
+}
+
+CODON_TABLE = [_GENETIC_CODE[c] for c in _CODONS]
+
+_AA_PROPERTIES = {
+    #        hydro    MW     vol     pI   charge  arom
+    'A': [ 1.8,   89.1,   88.6,  6.00,  0.0,  0.0],
+    'R': [-4.5,  174.2,  173.4, 10.76,  1.0,  0.0],
+    'N': [-3.5,  132.1,  114.1,  5.41,  0.0,  0.0],
+    'D': [-3.5,  133.1,  111.1,  2.77, -1.0,  0.0],
+    'C': [ 2.5,  121.2,  108.5,  5.07,  0.0,  0.0],
+    'E': [-3.5,  147.1,  138.4,  3.22, -1.0,  0.0],
+    'Q': [-3.5,  146.2,  143.8,  5.65,  0.0,  0.0],
+    'G': [-0.4,   75.0,   60.1,  5.97,  0.0,  0.0],
+    'H': [-3.2,  155.2,  153.2,  7.59,  0.1,  0.5],
+    'I': [ 4.5,  131.2,  166.7,  6.02,  0.0,  0.0],
+    'L': [ 3.8,  131.2,  166.7,  5.98,  0.0,  0.0],
+    'K': [-3.9,  146.2,  168.6,  9.74,  1.0,  0.0],
+    'M': [ 1.9,  149.2,  162.9,  5.74,  0.0,  0.0],
+    'F': [ 2.8,  165.2,  189.9,  5.48,  0.0,  1.0],
+    'P': [-1.6,  115.1,  112.7,  6.30,  0.0,  0.0],
+    'S': [-0.8,  105.1,   89.0,  5.68,  0.0,  0.0],
+    'T': [-0.7,  119.1,  116.1,  5.60,  0.0,  0.0],
+    'W': [-0.9,  204.2,  227.8,  5.89,  0.0,  1.0],
+    'Y': [-1.3,  181.2,  193.6,  5.66,  0.0,  1.0],
+    'V': [ 4.2,  117.1,  140.0,  5.96,  0.0,  0.0],
+    '*': [ 0.0,    0.0,    0.0,  0.00,  0.0,  0.0],
+}
+
+
+def build_codon_embeddings(vocab_size: int = 65, embed_dim: int = 64,
+                           codon_offset: int = 0,
+                           seed: int = 42) -> torch.Tensor:
+    """Build initial codon embeddings where synonymous codons cluster.
+
+    Each amino acid gets a base vector derived from biochemical properties
+    (hydrophobicity, MW, volume, pI, charge, aromaticity) projected to
+    ``embed_dim`` via a fixed random matrix. Synonymous codons share their
+    amino acid's base vector plus small noise to break exact degeneracy.
+
+    Args:
+        vocab_size: total vocabulary size (codons + special tokens).
+        embed_dim: embedding dimension.
+        codon_offset: index of the first codon in the vocabulary.
+            0 when codons occupy indices 0-63 (our model),
+            2 when PAD=0, UNK=1, codons at 2-65 (other model).
+        seed: random seed for reproducible projection.
+
+    Returns a (vocab_size, embed_dim) tensor suitable for assigning to
+    ``nn.Embedding.weight.data``.
+    """
+    rng = np.random.RandomState(seed)
+    n_props = 6
+
+    props = np.array([_AA_PROPERTIES[aa] for aa in sorted(_AA_PROPERTIES)])
+    aa_list = sorted(_AA_PROPERTIES.keys())
+    mean = props.mean(axis=0)
+    std = props.std(axis=0).clip(min=1e-8)
+    props = (props - mean) / std
+    aa_to_vec = {aa: props[i] for i, aa in enumerate(aa_list)}
+
+    projection = rng.randn(n_props, embed_dim).astype(np.float32)
+    projection *= 0.02 / np.sqrt(n_props)
+
+    embeddings = np.zeros((vocab_size, embed_dim), dtype=np.float32)
+
+    for codon_idx in range(64):
+        aa = CODON_TABLE[codon_idx]
+        base = aa_to_vec[aa] @ projection
+        noise = rng.randn(embed_dim).astype(np.float32) * 0.002
+        embeddings[codon_offset + codon_idx] = base + noise
+
+    return torch.from_numpy(embeddings)
 
 
 def compute_metrics(logits, labels, threshold=0.5):
@@ -164,6 +264,62 @@ def calibrate_temperature(model, loader, device, unpack_fn,
     return T, logits, labels
 
 
+def _optimize_temperature(logits, labels, lr=0.01, max_iter=200):
+    log_T = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.LBFGS([log_T], lr=lr, max_iter=max_iter)
+
+    def closure():
+        optimizer.zero_grad()
+        T = log_T.exp()
+        loss = F.binary_cross_entropy_with_logits(logits / T, labels)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return log_T.exp().item()
+
+
+def calibrate_temperature_split(model, loader, device, unpack_fn,
+                                n_extra_classes=1, lr=0.01, max_iter=200):
+    model.eval()
+    all_logits, all_labels = [], []
+    with torch.no_grad():
+        for batch in loader:
+            lo, la = unpack_fn(model, batch, device)
+            all_logits.append(lo.cpu())
+            all_labels.append(la.cpu())
+    logits = torch.cat(all_logits)
+    labels = torch.cat(all_labels)
+
+    n_host = logits.shape[1] - n_extra_classes
+    phage_mask = labels[:, -1] == 0
+
+    uncal_loss = F.binary_cross_entropy_with_logits(logits, labels).item()
+
+    host_logits = logits[phage_mask, :n_host]
+    host_labels = labels[phage_mask, :n_host]
+    T_host = _optimize_temperature(host_logits, host_labels, lr, max_iter)
+
+    bact_logits = logits[:, n_host:]
+    bact_labels = labels[:, n_host:]
+    T_bact = _optimize_temperature(bact_logits, bact_labels, lr, max_iter)
+
+    T_vec = torch.full((logits.shape[1],), T_host)
+    T_vec[n_host:] = T_bact
+    cal_loss = F.binary_cross_entropy_with_logits(logits / T_vec, labels).item()
+
+    n_phage = phage_mask.sum().item()
+    n_bact = (~phage_mask).sum().item()
+    logger.info(f"  Split temperature calibration:")
+    logger.info(f"    T_host={T_host:.4f} (on {n_phage} phage samples, "
+                f"{n_host} classes)")
+    logger.info(f"    T_bact={T_bact:.4f} (on {n_phage + n_bact} samples, "
+                f"{n_extra_classes} classes)")
+    logger.info(f"    BCE before: {uncal_loss:.5f}  after: {cal_loss:.5f}")
+
+    return T_host, T_bact, T_vec, logits, labels
+
+
 def find_fdr_thresholds(logits, labels, temperature,
                         target_fdrs=(0.10, 0.20), n_steps=500):
     """Find score thresholds that achieve target FDR levels.
@@ -256,7 +412,8 @@ def find_blocked_classes(logits, labels, temperature,
 
 def save_calibration(path, temperature, hosts, model_config,
                      threshold=0.5, fdr_thresholds=None,
-                     blocked_classes=None, eval_stride=None):
+                     blocked_classes=None, eval_stride=None,
+                     temperature_host=None, temperature_bacterial=None):
     """Save calibration.json alongside checkpoints."""
     data = {
         'temperature': temperature,
@@ -264,6 +421,10 @@ def save_calibration(path, temperature, hosts, model_config,
         'hosts': hosts.tolist() if hasattr(hosts, 'tolist') else list(hosts),
         'model_config': model_config,
     }
+    if temperature_host is not None:
+        data['temperature_host'] = temperature_host
+    if temperature_bacterial is not None:
+        data['temperature_bacterial'] = temperature_bacterial
     if eval_stride is not None:
         data['eval_stride'] = eval_stride
     if fdr_thresholds:
@@ -280,19 +441,32 @@ def save_calibration(path, temperature, hosts, model_config,
 
 def run_calibration(model, loader, device, unpack_fn, run_dir, hosts,
                     model_config, eval_threshold, min_val_precision,
-                    min_val_support, eval_stride=None):
+                    min_val_support, eval_stride=None, n_extra_classes=0):
     """Run temperature calibration, FDR thresholds, and class blocking."""
-    T, logits, labels = calibrate_temperature(
-        model, loader, device, unpack_fn)
+    T_host = None
+    T_bact = None
+
+    if n_extra_classes > 0:
+        T_host, T_bact, T_vec, logits, labels = calibrate_temperature_split(
+            model, loader, device, unpack_fn,
+            n_extra_classes=n_extra_classes)
+        T = T_vec
+    else:
+        T, logits, labels = calibrate_temperature(
+            model, loader, device, unpack_fn)
+
     fdr_thresholds = find_fdr_thresholds(logits, labels, T)
     blocked = find_blocked_classes(
         logits, labels, T,
         min_precision=min_val_precision,
         min_support=min_val_support,
     ) if min_val_precision > 0 else []
+
+    T_scalar = T if isinstance(T, float) else T_host
     save_calibration(
         os.path.join(run_dir, 'calibration.json'),
-        temperature=T, hosts=hosts, model_config=model_config,
+        temperature=T_scalar, hosts=hosts, model_config=model_config,
         threshold=eval_threshold, fdr_thresholds=fdr_thresholds,
         blocked_classes=blocked, eval_stride=eval_stride,
+        temperature_host=T_host, temperature_bacterial=T_bact,
     )

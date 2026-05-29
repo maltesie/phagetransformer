@@ -156,7 +156,11 @@ def load_model_and_calibration(model_dir: str, checkpoint: Optional[str],
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     logger.info(f"Loaded checkpoint: {ckpt_path}")
-    logger.info(f"Temperature: {calib['temperature']:.4f}")
+    if 'temperature_host' in calib and 'temperature_bacterial' in calib:
+        logger.info(f"Temperature: host={calib['temperature_host']:.4f}  "
+                    f"bacterial={calib['temperature_bacterial']:.4f}")
+    else:
+        logger.info(f"Temperature: {calib['temperature']:.4f}")
 
     return model, calib
 
@@ -167,11 +171,15 @@ def load_model_and_calibration(model_dir: str, checkpoint: Optional[str],
 
 @torch.no_grad()
 def predict_sequence(model, tokenizer, seq: str, patch_nt_len: int,
-                     stride: int, temperature: float,
+                     stride: int, temperature,
                      device: torch.device,
                      max_patches: int = 512,
                      blocked_classes: Optional[List[int]] = None) -> np.ndarray:
-    """Run model on one sequence, return calibrated probabilities (C,)."""
+    """Run model on one sequence, return calibrated probabilities (C,).
+
+    ``temperature`` can be a scalar float or a (C,) tensor for per-class
+    temperatures (e.g. separate host / bacterial temperatures).
+    """
     patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
     tokens, counts = tokenize_patches(patches, tokenizer)
     tokens = tokens.to(device, non_blocking=True)
@@ -186,10 +194,14 @@ def predict_sequence(model, tokenizer, seq: str, patch_nt_len: int,
 
 @torch.no_grad()
 def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
-                  stride: int, temperature: float, device: torch.device,
+                  stride: int, temperature, device: torch.device,
                   max_patches: int = 512,
                   blocked_classes: Optional[List[int]] = None) -> np.ndarray:
-    """Batch prediction for multiple sequences. Returns (B, C) probabilities."""
+    """Batch prediction for multiple sequences. Returns (B, C) probabilities.
+
+    ``temperature`` can be a scalar float or a (C,) tensor for per-class
+    temperatures (e.g. separate host / bacterial temperatures).
+    """
     all_patches, all_counts = [], []
     for seq in seqs:
         patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
@@ -327,11 +339,24 @@ def main():
         args.model_dir, args.checkpoint, device)
 
     hosts = calib['hosts']
-    temperature = calib['temperature']
     blocked_classes = calib.get('blocked_classes', [])
     patch_nt_len = calib['model_config']['patch_nt_len']
     stride = calib.get('eval_stride') or patch_nt_len // 2
     top_k = args.top_k
+
+    # Build per-class temperature: use split host/bacterial temperatures
+    # when available, otherwise fall back to the single scalar.
+    n_classes = calib['model_config']['num_classes']
+    has_bact = len(hosts) > 0 and hosts[-1] == 'bacterial_fragment'
+    if calib.get('temperature_host') is not None and has_bact:
+        T_host = calib['temperature_host']
+        T_bact = calib.get('temperature_bacterial', T_host)
+        n_host = n_classes - 1
+        temperature = torch.ones(n_classes)
+        temperature[:n_host] = T_host
+        temperature[n_host:] = T_bact
+    else:
+        temperature = calib['temperature']
 
     # Resolve threshold: --threshold overrides --fdr
     if args.threshold is not None:

@@ -60,6 +60,11 @@ def _read_fasta_raw(path: str) -> str:
 
     Uses raw line parsing instead of BioPython for ~5-10x faster loading
     on gzipped files.
+
+    Note: ``compute_phage_hit_regions.py`` carries a byte-for-byte copy
+    of this logic (named ``_read_fasta_concat`` there) so its alignment
+    coordinates land in this same coordinate system. If you change one,
+    change the other.
     """
     opener = gzip.open if path.endswith('.gz') else open
     parts = []
@@ -68,6 +73,57 @@ def _read_fasta_raw(path: str) -> str:
             if line.startswith('>'):
                 continue
             parts.append(line.strip().upper())
+    return ''.join(parts)
+
+
+def parse_phage_hit_regions_tsv(path: str) -> dict:
+    """Parse the TSV written by ``compute_phage_hit_regions.py``.
+
+    Returns ``{species: [(start, end), ...]}`` with intervals sorted and
+    non-overlapping (the script merges before writing; this sorts
+    defensively). Species with ``n_regions == 0`` are included as
+    empty lists.
+    """
+    df = pd.read_csv(path, sep='\t')
+    out: dict = {}
+    for _, row in df.iterrows():
+        sp = row['species']
+        regions_str = row.get('regions', '')
+        intervals = []
+        if isinstance(regions_str, str) and regions_str.strip():
+            for r in regions_str.split(';'):
+                s, e = r.split('-')
+                intervals.append((int(s), int(e)))
+            intervals.sort()
+        out[sp] = intervals
+    n_with_mask = sum(1 for v in out.values() if v)
+    n_regions = sum(len(v) for v in out.values())
+    logger.info(f"  phage_hit_regions.tsv: {len(out)} species "
+                f"({n_with_mask} with ≥1 region, "
+                f"{n_regions} regions total)")
+    return out
+
+
+def _excise_regions(seq: str, regions) -> str:
+    """Splice the given half-open intervals out of ``seq``. Regions are
+    assumed sorted (ascending start) and non-overlapping. Returns the
+    concatenation of the surviving non-masked spans — no N-padding, so
+    the model never sees a synthetic N stretch where phage homology
+    used to be."""
+    if not regions:
+        return seq
+    parts = []
+    prev_end = 0
+    for start, end in regions:
+        if start < 0 or end > len(seq) or start >= end:
+            raise ValueError(
+                f"Invalid mask region [{start}, {end}) for seq of "
+                f"length {len(seq)}.")
+        if start > prev_end:
+            parts.append(seq[prev_end:start])
+        prev_end = max(prev_end, end)
+    if prev_end < len(seq):
+        parts.append(seq[prev_end:])
     return ''.join(parts)
 
 
@@ -92,13 +148,23 @@ class BacterialGenomeStore:
                  val_frac: float = 0.2,
                  seed: int = 42,
                  one_per_genus: bool = False,
-                 genus_alpha: float = 0.25):
+                 genus_alpha: float = 0.25,
+                 mask_regions_tsv: str = None):
 
         manifest = os.path.join(host_genome_dir, 'host_genome_manifest.tsv')
         if not os.path.exists(manifest):
             raise FileNotFoundError(
                 f"No host_genome_manifest.tsv in {host_genome_dir}. "
                 f"Run the download script first.")
+
+        # Optional mask: per-species half-open intervals (in the
+        # concatenated coordinate system) to splice out of each genome
+        # before any split coordinate is computed. Produced by
+        # compute_phage_hit_regions.py — see that script's docstring.
+        mask_regions: dict = {}
+        if mask_regions_tsv is not None:
+            mask_regions = parse_phage_hit_regions_tsv(mask_regions_tsv)
+        self._masked = mask_regions_tsv is not None
 
         # Parse manifest — genome_path is resolved relative to host_genome_dir
         entries = []  # [(species, path), ...]
@@ -128,6 +194,9 @@ class BacterialGenomeStore:
         t0 = time.time()
         genomes = {}   # species -> sequence
         n_skipped = 0
+        n_excised = 0
+        total_pre_mask = 0
+        total_post_mask = 0
 
         for species, path in entries:
             if not os.path.exists(path):
@@ -135,7 +204,15 @@ class BacterialGenomeStore:
                 n_skipped += 1
                 continue
             try:
-                genomes[species] = _read_fasta_raw(path)
+                seq = _read_fasta_raw(path)
+                regions = mask_regions.get(species)
+                if regions:
+                    pre = len(seq)
+                    seq = _excise_regions(seq, regions)
+                    total_pre_mask += pre
+                    total_post_mask += len(seq)
+                    n_excised += 1
+                genomes[species] = seq
             except Exception as e:
                 logger.warning(f"    {species}: {e}")
                 n_skipped += 1
@@ -143,6 +220,14 @@ class BacterialGenomeStore:
         elapsed = time.time() - t0
         logger.info(f"  Loaded {len(genomes)} genomes in {elapsed:.1f}s "
                     f"({n_skipped} skipped)")
+        if self._masked:
+            if total_pre_mask > 0:
+                pct = 100 * (1 - total_post_mask / total_pre_mask)
+                logger.info(f"  Masking: excised regions in "
+                            f"{n_excised}/{len(genomes)} genomes "
+                            f"({pct:.3f}% of their total bp)")
+            else:
+                logger.info(f"  Masking: 0 genomes had regions to excise")
 
         self.genomes = genomes
 
@@ -209,13 +294,24 @@ class BacterialGenomeStore:
         This ensures evaluation uses the exact same splits as training.
         Species in the TSV that are not loaded are silently skipped;
         loaded species not in the TSV keep their random splits.
+
+        When the recorded ``genome_len`` of a row disagrees with the
+        loaded genome's length (typical cause: the splits TSV was
+        written by a run that didn't apply ``--bacterial_mask_regions``
+        and this run did, or vice versa), the row is skipped with a
+        warning rather than producing out-of-range val coordinates.
         """
         import pandas as _pd
         df = _pd.read_csv(path, sep='\t')
         n_applied = 0
+        n_mismatched = 0
         for _, row in df.iterrows():
             sp = row['species']
             if sp not in self.genomes:
+                continue
+            actual_len = len(self.genomes[sp])
+            if int(row['genome_len']) != actual_len:
+                n_mismatched += 1
                 continue
             self.splits[sp] = {
                 'val': (int(row['val_start']), int(row['val_end'])),
@@ -223,8 +319,13 @@ class BacterialGenomeStore:
                           (int(row['train2_start']), int(row['train2_end']))],
             }
             n_applied += 1
-        logger.info(f"  Loaded splits from {path}: {n_applied} species "
+        logger.info(f"  Loaded splits from {path}: {n_applied} species applied "
                     f"(of {len(df)} in file, {len(self.species_list)} loaded)")
+        if n_mismatched > 0:
+            logger.warning(
+                f"  {n_mismatched} species in splits TSV had genome_len "
+                f"mismatching the loaded genomes (likely a masking "
+                f"difference between runs); those keep their random splits.")
 
     def sample_subseq(self, split: str, subseq_len: int) -> tuple:
         """Sample a random subsequence from the given split ('train' or 'val').
@@ -285,6 +386,7 @@ def _compute_patches_per_seq(labels, sequences, min_patches, max_patches, patch_
     """
     class_counts = labels.sum(axis=0).clip(min=1)
     max_count = class_counts.max()
+    min_count = class_counts.min()
     counts = []
     for lab, seq in zip(labels, sequences):
         active = np.where(lab > 0)[0]
@@ -292,11 +394,31 @@ def _compute_patches_per_seq(labels, sequences, min_patches, max_patches, patch_
             counts.append(min_patches)
             continue
         # ratio → 0 for rare, 1 for common
-        ratio = class_counts[active].min() / max_count
+        ratio = (class_counts[active].min() - min_count) / max_count
         n = int(len(seq) / patch_len) + 1
         f = max_patches - ratio * (max_patches - min_patches)
         counts.append(int(n if n <= 2 else f * n))
     return counts
+
+
+def _compute_repeats_per_seq(labels, min_reps, max_reps):
+    class_counts = np.log(labels.sum(axis=0).clip(min=1))
+    max_count = class_counts.max()
+    min_count = class_counts.min()
+    reps_base = []
+    reps_extra_prob = []
+    for lab in labels:
+        active = np.where(lab > 0)[0]
+        if len(active) == 0:
+            reps_base.append(1)
+            reps_extra_prob.append(0.0)
+            continue
+        ratio = (class_counts[active].min() - min_count) / max_count
+        f = max_reps - ratio * (max_reps - min_reps)
+        base = int(f)
+        reps_base.append(base)
+        reps_extra_prob.append(f - base)
+    return reps_base, reps_extra_prob
 
 
 class RandomPatchDataset(Dataset):
@@ -467,7 +589,8 @@ class PatchSequenceDataset(Dataset):
     def __init__(self, sequences, labels, tokenizer, patch_nt_len=4096,
                  max_patches=512, is_train=True, eval_stride=None,
                  coverage=2.0, seq_drop_rate=0.0, patch_drop_rate=0.0,
-                 scramble_rate=0.1):
+                 scramble_rate=0.1,
+                 min_seq_repeats=1.0, max_seq_repeats=3.0):
         self.sequences = sequences
         self.labels = labels
         self.tokenizer = tokenizer
@@ -480,12 +603,31 @@ class PatchSequenceDataset(Dataset):
         self.scramble_rate = scramble_rate
         self.zero_label = np.zeros(len(labels[0]), dtype=np.float32)
         
-        # Compute strides
         self.train_stride = max(1, int(patch_nt_len / coverage))
         self.eval_stride = eval_stride or patch_nt_len // 2
 
+        if is_train:
+            self._reps_base, self._reps_extra_prob = \
+                _compute_repeats_per_seq(labels, min_seq_repeats, max_seq_repeats)
+            self._extra_candidates = [si for si, p in enumerate(
+                self._reps_extra_prob) if p > 0]
+            self._n_extras = round(sum(self._reps_extra_prob))
+            self.resample_index()
+        else:
+            self.index = None
+
+    def resample_index(self):
+        self.index = []
+        for si, base in enumerate(self._reps_base):
+            self.index.extend([si] * base)
+        if self._n_extras > 0 and self._extra_candidates:
+            n = min(self._n_extras, len(self._extra_candidates))
+            chosen = np.random.choice(
+                self._extra_candidates, size=n, replace=False)
+            self.index.extend(chosen.tolist())
+
     def __len__(self):
-        return len(self.sequences)
+        return len(self.index) if self.index is not None else len(self.sequences)
 
     def _tile(self, seq, stride):
         plen = self.patch_nt_len
@@ -503,8 +645,9 @@ class PatchSequenceDataset(Dataset):
         return patches[:self.max_patches]
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        label = self.labels[idx]
+        si = self.index[idx] if self.index is not None else idx
+        seq = self.sequences[si]
+        label = self.labels[si]
         
         if self.is_train:
             
@@ -514,13 +657,18 @@ class PatchSequenceDataset(Dataset):
                 seq = ''.join(chars)
                 label = self.zero_label
                                 
-            # Cut away a contiguous chunk at a random position, keep the rest
+            # Cut away a contiguous chunk from the circularised sequence
             if self.seq_drop_rate > 0 and len(seq) > self.patch_nt_len:
                 drop_frac = random.random() * self.seq_drop_rate
                 drop_nt = int(len(seq) * drop_frac)
                 if drop_nt > 0 and len(seq) - drop_nt >= self.patch_nt_len:
-                    cut_start = random.randint(0, len(seq) - drop_nt)
-                    seq = seq[:cut_start] + seq[cut_start + drop_nt:]
+                    cut_start = random.randint(0, len(seq) - 1)
+                    cut_end = cut_start + drop_nt
+                    if cut_end <= len(seq):
+                        seq = seq[:cut_start] + seq[cut_end:]
+                    else:
+                        # Wrap around: drop tail + head, keep the middle
+                        seq = seq[cut_end - len(seq):cut_start]
 
             # Random offset shifts the tiling grid each epoch
             max_offset = self.patch_nt_len // 2

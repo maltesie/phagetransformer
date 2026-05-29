@@ -7,6 +7,8 @@ import torch.utils.checkpoint as checkpoint_util
 import numpy as np
 from typing import Optional, Tuple
 
+from .utils import build_codon_embeddings
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,39 +142,36 @@ class PerFrameCNN(nn.Module):
                 x = self.pool0(x)
         return x
 
-
 # ---------------------------------------------------------------------------
 # Cross-frame attention
 # ---------------------------------------------------------------------------
 
 class CrossFrameAttention(nn.Module):
-    """Attend across the 6 reading frames per position, mean-pool to one seq."""
 
     def __init__(self, dim: int, num_heads: int = 16, dropout: float = 0.1):
         super().__init__()
-        self.num_heads, self.head_dim = num_heads, dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
+        # num_heads kept in signature for drop-in compatibility but ignored
+        # — this layer is single-head by design (see design notes).
+        self.norm = nn.LayerNorm(dim)  
+        self.query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.key_proj = nn.Linear(dim, dim)
+        self.value_proj = nn.Linear(dim, dim)
+        self.scale = dim ** -0.5
         self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor,
-                return_weights: bool = False):
-        """x: (B, 6, L', D) -> (B, L', D) or ((B, L', D), (B, L', 6))"""
+    def forward(self, x: torch.Tensor, return_weights: bool = False):
+        """x: (B, 6, L', D) -> (B, L', D) or ((B, L', D), (B, L', 6))."""
         B, F_, L, D = x.shape
-        xf = x.permute(0, 2, 1, 3).reshape(B * L, F_, D)
-        q = self.q_proj(xf).reshape(B * L, F_, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(xf).reshape(B * L, F_, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(xf).reshape(B * L, F_, self.num_heads, self.head_dim).transpose(1, 2)
-        a = self.dropout(F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale, dim=-1))
-        out = torch.matmul(a, v).transpose(1, 2).reshape(B * L, F_, D)
-        merged = self.norm(self.out_proj(out).mean(dim=1).reshape(B, L, D))
+        xf = x.permute(0, 2, 1, 3).reshape(B * L, F_, D)        # (B*L, 6, D)
+        xf = self.norm(xf)
+        K = self.key_proj(xf)                                    # (B*L, 6, D)
+        V = self.value_proj(xf)                                  # (B*L, 6, D)
+        q = self.query.expand(B * L, -1, -1)                     # (B*L, 1, D)
+        scores = torch.matmul(q, K.transpose(-2, -1)).squeeze(1) * self.scale  # (B*L, 6)
+        w = self.dropout(F.softmax(scores / 0.05, dim=-1))              # (B*L, 6)
+        merged = (w.unsqueeze(-1) * V).sum(dim=1).reshape(B, L, D)
         if return_weights:
-            w = a.mean(dim=1).mean(dim=1).reshape(B, L, F_)
-            return merged, w
+            return merged, w.reshape(B, L, F_)                   # (B, L', 6)
         return merged
 
 # ---------------------------------------------------------------------------
@@ -366,6 +365,13 @@ class PatchEncoder(nn.Module):
         feats = self.frame_cnn(flat)
         D, Lp = feats.size(1), feats.size(2)
         feats = feats.reshape(B, NF, D, Lp)
+
+        # Branch receives unflipped features — it flips internally
+        # after its own per-frame CNN, so the conv filters see each
+        # frame in its native orientation.
+        feats_unflipped = feats
+
+        feats = feats.clone()
         feats[:, 3] = torch.flip(feats[:, 3], dims=[2])
         feats[:, 4] = torch.flip(feats[:, 4], dims=[2])
         feats[:, 5] = torch.flip(feats[:, 5], dims=[2])
@@ -383,7 +389,7 @@ class PatchEncoder(nn.Module):
 
         if return_weights:
             branch_emb, branch_frame_w, branch_pool_w = \
-                self.frame_stats_branch(feats, return_weights=True)
+                self.frame_stats_branch(feats_unflipped, return_weights=True)
             pooled = pooled + branch_emb
             return pooled, {
                 'frame_w': frame_w,
@@ -392,7 +398,7 @@ class PatchEncoder(nn.Module):
                 'branch_pool_w': branch_pool_w,
             }
         else:
-            pooled = pooled + self.frame_stats_branch(feats)
+            pooled = pooled + self.frame_stats_branch(feats_unflipped)
             return pooled
 
 
@@ -461,12 +467,25 @@ class FrameStatsBranch(nn.Module):
     def forward(self, frame_feats: torch.Tensor,
                 return_weights: bool = False):
         """frame_feats: (B, 6, D, L') → (B, output_dim)
-        or (embedding, frame_w, pool_w) when return_weights=True."""
+        or (embedding, frame_w, pool_w) when return_weights=True.
+
+        Expects unflipped features: reverse-complement frames (3-5) are
+        flipped along the sequence axis after the per-frame CNN so each
+        conv filter sees the native orientation, but positions align
+        across all six frames before the cross-frame merge.
+        """
         B, F_, D, L = frame_feats.shape
         x = frame_feats.reshape(B * F_, D, L)              # (B*6, D, L')
         x = self.frame_cnn(x)                               # (B*6, C, L')
         C, Lp = x.size(1), x.size(2)
-        x = x.reshape(B, F_, C, Lp).permute(0, 1, 3, 2)   # (B, 6, L', C)
+        x = x.reshape(B, F_, C, Lp)
+
+        # Flip rev-comp frames to align with forward frames
+        x[:, 3] = torch.flip(x[:, 3], dims=[2])
+        x[:, 4] = torch.flip(x[:, 4], dims=[2])
+        x[:, 5] = torch.flip(x[:, 5], dims=[2])
+
+        x = x.permute(0, 1, 3, 2)                          # (B, 6, L', C)
 
         x, frame_w = self.cross_frame_attn(
             x, return_weights=True)                         # (B, L', C), (B, L', 6)
@@ -537,9 +556,11 @@ class HierarchicalDNAClassifier(nn.Module):
                  patches_per_forward: int = 48, frame_stats_channels: int = 64,
                  frame_stats_kernel_size: int = 3, patch_nt_len: int = 3072,
                  dropout: float = 0.1, gradient_checkpointing: bool = False,
-                 cnn_kernel_sizes: Optional[list] = None):
+                 cnn_kernel_sizes: Optional[list] = None,
+                 bio_codon_init: bool = False):
         super().__init__()
         self.patches_per_forward = patches_per_forward
+        self.bio_codon_init = bio_codon_init
         self.patch_encoder = PatchEncoder(
             vocab_size=vocab_size, cnn_embed_dim=cnn_embed_dim,
             cnn_hidden_dim=cnn_hidden_dim, transformer_dim=transformer_dim,
@@ -563,7 +584,11 @@ class HierarchicalDNAClassifier(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
+                if self.bio_codon_init:
+                    m.weight.data = build_codon_embeddings(
+                        m.num_embeddings, m.embedding_dim, codon_offset=2)
+                else:
+                    nn.init.normal_(m.weight, std=0.02)
 
     def forward(self, patches: torch.Tensor, patch_counts: torch.Tensor) -> torch.Tensor:
         """

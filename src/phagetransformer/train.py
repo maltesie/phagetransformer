@@ -238,6 +238,7 @@ def run_phase(
     checkpoint_model: Optional[nn.Module] = None,
     save_component: Optional[str] = None,
     n_extra_classes: int = 0,
+    resample_dataset=None,
 ) -> Tuple[float, int]:
     """Run one training phase. Returns (best_val_f1, last_global_epoch).
 
@@ -270,6 +271,8 @@ def run_phase(
                 f"warmup={warmup_steps}")
 
     for ep in range(num_epochs):
+        if resample_dataset is not None and hasattr(resample_dataset, 'resample_index'):
+            resample_dataset.resample_index()
         global_ep = epoch_offset + ep + 1
         t0 = time.time()
         logger.info(f"--- {phase_name} epoch {ep+1}/{num_epochs}  "
@@ -356,6 +359,9 @@ def main():
     g.add_argument('--transformer_dim', type=int, default=300)
     g.add_argument('--num_transformer_layers', type=int, default=4)
     g.add_argument('--num_heads', type=int, default=10)
+    g.add_argument('--bio_codon_init', action='store_true',
+                   help='Initialize codon embeddings from biochemical '
+                        'properties (default: random normal init)')
 
     # -- model: aggregator --------------------------------------------------
     g = parser.add_argument_group('Sequence aggregator')
@@ -386,6 +392,10 @@ def main():
                    help='Aggregator phase train: max fraction of sequence to truncate')
     g.add_argument('--patch_drop_rate', type=float, default=0.1,
                    help='Aggregator phase train: max fraction of patches to drop after tiling')
+    g.add_argument('--min_seq_repeats', type=float, default=1.0,
+                   help='Aggregator phase: sequence repeats per epoch for common-class sequences')
+    g.add_argument('--max_seq_repeats', type=float, default=3.0,
+                   help='Aggregator phase: sequence repeats per epoch for rarest-class sequences')
     g.add_argument('--patches_per_forward', type=int, default=32)
     g.add_argument('--max_patches', type=int, default=512,
                    help='Hard cap on patches per sequence (memory guard)')
@@ -451,6 +461,15 @@ def main():
                    help='Directory with host_genome_manifest.tsv '
                         '(required for bacterial_fragment class in encoder '
                         'and aggregator phases)')
+    g.add_argument('--bacterial_mask_regions', type=str, default=None,
+                   help='Path to phage_hit_regions.tsv (written by '
+                        'compute_phage_hit_regions.py). When set, each '
+                        'bacterial genome has its phage-matched regions '
+                        'excised before train/val splitting — preventing '
+                        'leakage from phage-derived sequence content into '
+                        'the bacterial_fragment class. Excision (not '
+                        'N-masking) avoids introducing a learnable N-stretch '
+                        'artifact.')
     g.add_argument('--one_genome_per_genus', action='store_true',
                    help='Keep only one genome per genus from the manifest')
     g.add_argument('--genus_alpha', type=float, default=0.25,
@@ -524,6 +543,7 @@ def main():
             seed=args.seed,
             one_per_genus=args.one_genome_per_genus,
             genus_alpha=args.genus_alpha,
+            mask_regions_tsv=args.bacterial_mask_regions,
         )
         genome_store.write_species_log(
             os.path.join(run_dir, 'logs', 'bacterial_species.tsv'))
@@ -559,6 +579,7 @@ def main():
         frame_stats_kernel_size=args.frame_stats_kernel_size,
         dropout=args.dropout, cnn_kernel_sizes=args.cnn_kernels,
         patch_nt_len=args.patch_nt_len,
+        bio_codon_init=args.bio_codon_init,
     )
 
     device = torch.device(args.device)
@@ -606,14 +627,31 @@ def main():
             patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
             is_train=False, eval_stride=args.eval_stride,
         )
+        if use_bacteria:
+            phage_lengths = [len(s) for s in train_seqs]
+            n_bacteria_val = max(1, int(len(val_seqs)
+                                        * args.aggregator_bacteria_ratio))
+            bact_val_ds = BacterialSequenceDataset(
+                genome_store, tokenizer, phage_lengths,
+                n_samples=n_bacteria_val,
+                agg_num_classes=agg_num_classes,
+                genus_to_idx=genus_to_idx,
+                patch_nt_len=args.patch_nt_len,
+                max_patches=args.max_patches, is_train=False,
+                eval_stride=args.eval_stride,
+            )
+            combined_val_ds = ConcatDataset([val_seq_ds, bact_val_ds])
+        else:
+            combined_val_ds = val_seq_ds
         val_loader = DataLoader(
-            val_seq_ds, batch_size=args.aggregator_batch_size, shuffle=False,
-            collate_fn=sequence_collate_fn, **ldr_kw)
+            combined_val_ds, batch_size=args.aggregator_batch_size,
+            shuffle=False, collate_fn=sequence_collate_fn, **ldr_kw)
 
         run_calibration(model, val_loader, device, _unpack_sequence_batch,
                         run_dir, calib_hosts, model_config, args.eval_threshold,
                         args.min_val_precision, args.min_val_support,
-                        eval_stride=args.eval_stride)
+                        eval_stride=args.eval_stride,
+                        n_extra_classes=n_extra_classes)
         logger.info("Calibration complete.")
         return
 
@@ -810,6 +848,8 @@ def main():
         seq_drop_rate=args.seq_drop_rate,
         patch_drop_rate=args.patch_drop_rate,
         scramble_rate=args.seq_scramble_rate,
+        min_seq_repeats=args.min_seq_repeats,
+        max_seq_repeats=args.max_seq_repeats,
     )
     if use_bacteria:
         bact_train_ds = BacterialSequenceDataset(
@@ -912,6 +952,7 @@ def main():
             ckpt_dir=ckpt_dir, csv_log=csv_log, use_bf16=args.bf16,
             epoch_offset=epoch_offset, best_val_f1=best_f1,
             n_extra_classes=n_extra_classes,
+            resample_dataset=train_seq_ds,
         )
         logger.info("  Aggregator phase done.")
         load_best_or_last(ckpt_dir, 'aggregator', model)
@@ -933,7 +974,8 @@ def main():
         run_calibration(model, seq_val_loader, device, _unpack_sequence_batch,
                         run_dir, hosts, model_config, args.eval_threshold,
                         args.min_val_precision, args.min_val_support,
-                        eval_stride=args.eval_stride)
+                        eval_stride=args.eval_stride,
+                        n_extra_classes=n_extra_classes)
     else:
         logger.info("\n--- Skipping calibration (--merge_val mode) ---")
         logger.info("  Copy calibration.json from your tuning run into this "
