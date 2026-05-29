@@ -36,9 +36,9 @@ from phagetransformer.dataset import (
     BacterialSequenceDataset, sequence_collate_fn,
 )
 from eval_utils import (
-    COLORS, LEVEL_NAMES, FONT_SIZES,
-    setup_style, _add_panel_letters, _suptitle,
-    enable_presentation_mode,
+    COLORS, LEVEL_NAMES, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
+    setup_style, _add_panel_letters, _output_path, _suptitle,
+    _save_figure, enable_presentation_mode,
     collect_logits, parse_lineages, aggregate_to_level,
 )
 
@@ -381,7 +381,7 @@ def _violin_box(ax, data, labels_list, colors, ylabel, title):
         plt.setp(bp[element], color=COLORS['text_light'], linewidth=1)
 
     ax.set_xticks(positions)
-    ax.set_xticklabels(labels_list, fontsize=FONT_SIZES['tick'])
+    ax.set_xticklabels(labels_list, fontsize=FONT_SIZES['label'])
     ax.set_ylabel(ylabel)
     ax.set_ylim(-0.05, 1.05)
     ax.set_title(title, fontweight='bold', pad=8)
@@ -392,7 +392,7 @@ def _violin_box(ax, data, labels_list, colors, ylabel, title):
         if len(d) > 0:
             med = np.median(d)
             ax.text(i, med + 0.03, f'{med:.2f}', ha='center',
-                    fontsize=FONT_SIZES['bar_value'], color=COLORS['text'])
+                    fontsize=FONT_SIZES['label'], color=COLORS['text'])
 
 
 def plot_classification_violins(ax, genus_probs, genus_labels, hosts,
@@ -457,7 +457,7 @@ def plot_classification_pr(ax, genus_probs, genus_labels, hosts):
     ax.set_ylim(0, 1.02)
     ax.set_title('Classification macro PR\n(bacterial samples)',
                  fontweight='bold', pad=8)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='lower left',
+    ax.legend(fontsize=FONT_SIZES['label'], loc='lower left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
 
@@ -509,7 +509,7 @@ def plot_chimera_sensitivity(ax, chimera_df, threshold):
     """
     if chimera_df.empty:
         ax.text(0.5, 0.5, 'No chimera data', transform=ax.transAxes,
-                ha='center', va='center', fontsize=FONT_SIZES['fallback_msg'])
+                ha='center', va='center', fontsize=FONT_SIZES['label'])
         ax.set_axis_off()
         return
 
@@ -546,26 +546,12 @@ def plot_chimera_sensitivity(ax, chimera_df, threshold):
     ax.set_ylim(-0.02, 1.02)
     ax.set_title('Detection sensitivity\n(phage–bacteria chimeras)',
                  fontweight='bold', pad=8)
-    ax.legend(fontsize=FONT_SIZES['legend_small'], loc='upper left',
+    ax.legend(fontsize=FONT_SIZES['label'], loc='upper left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
 
 
 # ---------------------------------------------------------------------------
-# Save helper
-# ---------------------------------------------------------------------------
-
-def _save_figure(fig, out_path: str, dpi: int = 200):
-    fig.savefig(out_path, dpi=dpi)
-    logger.info(f"Figure saved: {out_path}")
-    root = os.path.splitext(out_path)[0]
-    for ext in ('.pdf', '.svg'):
-        path = root + ext
-        fig.savefig(path, bbox_inches='tight', facecolor='white')
-        logger.info(f"Figure saved: {path}")
-    plt.close(fig)
-
-
 # ---------------------------------------------------------------------------
 # Main figure
 # ---------------------------------------------------------------------------
@@ -583,9 +569,9 @@ def make_bacteria_figure(genus_probs_cls, genus_labels_cls,
     """
     setup_style()
 
-    fig = plt.figure(figsize=(12, 9))
-    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.35,
-                           left=0.08, right=0.96, top=0.93, bottom=0.07)
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32,
+                           left=0.07, right=0.97, top=0.93, bottom=0.07)
 
     ax_a = fig.add_subplot(gs[0, 0])
     plot_classification_violins(ax_a, genus_probs_cls, genus_labels_cls,
@@ -762,7 +748,8 @@ def main():
     # ---- generate figure -------------------------------------------------
     plot_dir = os.path.join(args.model_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
-    out_path = args.output or os.path.join(plot_dir, 'bacteria_evaluation.png')
+    out_path = _output_path(
+        args.output or os.path.join(plot_dir, 'bacteria_evaluation.png'))
 
     logger.info("Generating bacterial evaluation figure ...")
     make_bacteria_figure(

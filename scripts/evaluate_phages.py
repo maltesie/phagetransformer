@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 import pandas as pd
 import torch
@@ -153,7 +154,7 @@ def plot_calibration(ax, logits: torch.Tensor, labels: torch.Tensor,
     weights = bin_count[valid] / bin_count[valid].sum()
     ece = (weights * np.abs(bin_acc[valid] - bin_conf[valid])).sum()
     ax.text(0.05, 0.92, f'ECE = {ece:.4f}', transform=ax.transAxes,
-            fontsize=FONT_SIZES['overlay'], color=COLORS['text'])
+            fontsize=FONT_SIZES['label'], color=COLORS['text'])
 
     ax.set_xlabel('Predicted probability')
     ax.set_ylabel('Observed frequency')
@@ -164,34 +165,39 @@ def plot_calibration(ax, logits: torch.Tensor, labels: torch.Tensor,
 
 
 def plot_taxonomic_metrics(ax, level_results: Dict[str, Dict]):
-    """Grouped bar chart of metrics across taxonomic levels."""
+    """Grouped bar chart of metrics, grouped by metric and colored by rank."""
     levels = list(level_results.keys())
     metrics = ['micro_f1', 'macro_f1', 'micro_p', 'micro_r']
-    labels = ['Micro F1', 'Macro F1', 'Precision', 'Recall']
-    colors = [METRIC_COLORS[m] for m in metrics]
+    metric_labels = ['Micro F1', 'Macro F1', 'Precision', 'Recall']
+    rank_palette = [COLORS['primary'], COLORS['secondary'], COLORS['tertiary'],
+                    COLORS['quaternary'], COLORS['quinary'], COLORS['senary']]
 
-    x = np.arange(len(levels))
-    width = 0.18
-    offsets = np.array([-1.5, -0.5, 0.5, 1.5]) * width
+    n_levels = len(levels)
+    n_metrics = len(metrics)
+    x = np.arange(n_metrics)
+    width = 0.8 / n_levels
+    offsets = (np.arange(n_levels) - (n_levels - 1) / 2) * width
 
-    for i, (metric, label, color) in enumerate(zip(metrics, labels, colors)):
-        values = [level_results[lvl][metric] for lvl in levels]
-        bars = ax.bar(x + offsets[i], values, width, label=label,
+    for li, lvl in enumerate(levels):
+        values = [level_results[lvl][m] for m in metrics]
+        color = rank_palette[li % len(rank_palette)]
+        bars = ax.bar(x + offsets[li], values, width, label=lvl,
                       color=color, edgecolor='white', linewidth=0.5)
         for bar, val in zip(bars, values):
             if val > 0.02:
                 ax.text(bar.get_x() + bar.get_width() / 2,
                         bar.get_height() + 0.008,
                         f'{val:.2f}', ha='center', va='bottom',
-                        fontsize=FONT_SIZES['overlay'], color=COLORS['text_light'])
+                        fontsize=FONT_SIZES['label'], color=COLORS['text_light'],
+                        rotation=90)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(levels)
+    ax.set_xticklabels(metric_labels)
     ax.set_ylabel('Score')
-    ax.set_ylim(0, 1.18)
+    ax.set_ylim(0, 1.25)
     ax.set_yticks(np.arange(0, 1.01, 0.2))
     ax.set_title('Metrics by taxonomic rank')
-    ax.legend(ncol=4, loc='upper center',
+    ax.legend(ncol=n_levels, loc='upper center',
               bbox_to_anchor=(0.5, 1.0))
 
 
@@ -398,50 +404,101 @@ _AA_PALETTE = {
     'Stop': '#2D2D2D',
 }
 
+# Amino acid functional groups (standard biochemistry textbook)
+AA_FUNCTIONAL_GROUP = {
+    'Gly': 'Nonpolar',  'Ala': 'Nonpolar',  'Val': 'Nonpolar',
+    'Leu': 'Nonpolar',  'Ile': 'Nonpolar',  'Pro': 'Nonpolar',
+    'Met': 'Nonpolar',
+    'Phe': 'Aromatic',  'Trp': 'Aromatic',  'Tyr': 'Aromatic',
+    'Ser': 'Polar',     'Thr': 'Polar',     'Cys': 'Polar',
+    'Asn': 'Polar',     'Gln': 'Polar',
+    'Lys': 'Positive',  'Arg': 'Positive',  'His': 'Positive',
+    'Asp': 'Negative',  'Glu': 'Negative',
+    'Stop': 'Stop',
+}
+
 
 def _codon_gc(codon: str) -> float:
     """GC fraction of a 3-letter codon."""
     return sum(1 for c in codon if c in 'GC') / 3.0
 
 
+def silhouette_score(X: np.ndarray, labels: np.ndarray,
+                     D: Optional[np.ndarray] = None) -> float:
+    """Mean silhouette score measuring how well points cluster by label.
+
+    Uses Euclidean distance by default.
+
+    For each point i with label L:
+      a(i) = mean distance to other points with the same label L
+      b(i) = min over other labels L' of mean distance to points with label L'
+      s(i) = (b(i) - a(i)) / max(a(i), b(i))
+
+    Returns mean s(i) over all points.  Range: [-1, 1], higher = better
+    label-based clustering.  Points in singleton groups get s = 0.
+
+    If ``D`` (precomputed distance matrix) is provided, ``X`` is ignored.
+    """
+    from scipy.spatial.distance import cdist
+    if D is None:
+        D = cdist(X, X, metric='euclidean')
+    unique_labels = np.unique(labels)
+    n = len(labels)
+    sil = np.zeros(n)
+
+    for i in range(n):
+        same = labels == labels[i]
+        n_same = same.sum()
+        if n_same <= 1:
+            sil[i] = 0.0
+            continue
+        a_i = D[i, same].sum() / (n_same - 1)
+
+        b_i = np.inf
+        for lbl in unique_labels:
+            if lbl == labels[i]:
+                continue
+            other = labels == lbl
+            if other.sum() == 0:
+                continue
+            b_i = min(b_i, D[i, other].mean())
+
+        sil[i] = (b_i - a_i) / max(a_i, b_i, 1e-12)
+
+    return float(sil.mean())
+
+
 def silhouette_with_pvalue(X: np.ndarray, labels: np.ndarray,
-                           n_perm: int = 1000, seed: int = 42,
-                           metric: str = 'euclidean') -> tuple:
+                           n_perm: int = 1000, seed: int = 42) -> tuple:
     """Silhouette score with permutation-test p-value.
 
-    Uses sklearn.metrics.silhouette_score with precomputed distances
-    for speed.  Shuffles labels ``n_perm`` times and computes the
-    fraction of permuted scores >= observed score.
+    Shuffles labels ``n_perm`` times and computes the fraction of
+    permuted scores >= observed score.
 
     Returns (score, p_value).
     """
-    from sklearn.metrics import silhouette_score as _sk_silhouette
-    from scipy.spatial.distance import squareform, pdist
-
+    from scipy.spatial.distance import cdist
     rng = np.random.default_rng(seed)
-    D = squareform(pdist(X, metric=metric))
-    D = np.clip(D, 0, None)  # cosine can produce tiny negatives
-    observed = _sk_silhouette(D, labels, metric='precomputed')
+    D = cdist(X, X, metric='euclidean')
+    observed = silhouette_score(X, labels, D)
 
     count_ge = 0
     for _ in range(n_perm):
         perm_labels = rng.permutation(labels)
-        if _sk_silhouette(D, perm_labels, metric='precomputed') >= observed:
+        if silhouette_score(X, perm_labels, D) >= observed:
             count_ge += 1
 
     p = (count_ge + 1) / (n_perm + 1)   # conservative estimate
-    return float(observed), float(p)
+    return observed, float(p)
 
 
 # ---------------------------------------------------------------------------
 # Figure 3 — Codon embedding PCA
 # ---------------------------------------------------------------------------
 
-def make_embedding_figure(model, out_path: str, dpi: int = 200,
-                          show_mds: bool = False):
-    """PCA (and optionally MDS cosine) of learned codon embeddings."""
+def make_embedding_figures(model, out_dir: str, dpi: int = 200):
+    """PCA, UMAP, and t-SNE of learned codon embeddings (3 figures)."""
     setup_style()
-    from scipy.spatial.distance import cdist as _cdist
 
     # Extract embedding weights (skip PAD=0 and UNK=1)
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -456,76 +513,97 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
     # PCA via SVD
     centered = codon_embs - codon_embs.mean(axis=0, keepdims=True)
     U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-    pc = centered @ Vt[:2].T                       # (64, 2)
-    var_explained = S[:2] ** 2 / (S ** 2).sum()
-
-    # MDS on cosine distances (optional)
-    mds, stress = None, None
-    if show_mds:
-        D_cos = _cdist(codon_embs, codon_embs, metric='cosine')
-        D_cos = np.clip(D_cos, 0, None)
-        D2 = D_cos ** 2
-        n = D2.shape[0]
-        H_mat = np.eye(n) - np.ones((n, n)) / n
-        B = -0.5 * H_mat @ D2 @ H_mat
-        eigvals, eigvecs = np.linalg.eigh(B)
-        idx_top = np.argsort(eigvals)[::-1][:2]
-        mds = eigvecs[:, idx_top] * np.sqrt(np.maximum(eigvals[idx_top], 0))
-        D_mds = _cdist(mds, mds, metric='euclidean')
-        stress = np.sqrt(
-            ((D_cos - D_mds) ** 2).sum() / (D_cos ** 2).sum())
+    all_var = S ** 2 / (S ** 2).sum()
 
     # Amino acid labels
     aa_labels = [CODON_TO_AA[c] for c in codons]
     aa_label_arr = np.array(aa_labels)
     unique_aa = sorted(set(aa_labels), key=lambda x: (x == 'Stop', x))
 
-    # Silhouette score on first 2 PCs
-    sil, sil_p = silhouette_with_pvalue(pc, aa_label_arr)
-
-    # Wobble nucleotide identity (3rd position) — 4 categories
-    wobble_nt = np.array([c[2] for c in codons])
-    _WOBBLE_NT_COLORS = {
-        'A': COLORS['primary'],     # blue
-        'G': COLORS['tertiary'],    # green
-        'T': COLORS['secondary'],   # red
-        'C': COLORS['quaternary'],  # orange
-    }
-
-    # Purine fraction per codon (0, 1/3, 2/3, 1)
+    # All label sets
+    func_labels = np.array([AA_FUNCTIONAL_GROUP[aa] for aa in aa_labels])
     purine_fraction = np.array([sum(1 for nt in c if nt in 'AG') / 3.0
                                 for c in codons])
+    purine_labels = np.array([f'{v:.2f}' for v in purine_fraction])
+    wobble_nuc = [c[2] for c in codons]
+    wobble_label_arr = np.array(wobble_nuc)
 
-    # Silhouette score for wobble nucleotide identity on first 2 PCs
-    sil_wob, sil_wob_p = silhouette_with_pvalue(pc, wobble_nt)
+    # ---- 30-PC silhouette scores (logged only) ----
+    n_sil_pcs = min(30, centered.shape[1])
+    pcs_30 = centered @ Vt[:n_sil_pcs].T
+    label_sets = [
+        ('Amino acid',       aa_label_arr),
+        ('Functional group', func_labels),
+        ('Wobble nucleotide', wobble_label_arr),
+        ('Purine fraction',  purine_labels),
+    ]
+    logger.info(f"  Silhouette scores (Euclidean) on first {n_sil_pcs} PCs:")
+    sil_30pc = {}
+    for lbl_name, lbl_arr in label_sets:
+        s = silhouette_score(pcs_30, lbl_arr)
+        sil_30pc[lbl_name] = s
+        logger.info(f"    {lbl_name:20s}: {s:.4f}")
 
-    # 2 PCs with cosine distance
-    sil_2c, sil_2c_p = silhouette_with_pvalue(pc, aa_label_arr, metric='cosine')
-    sil_wob_2c, sil_wob_2c_p = silhouette_with_pvalue(pc, wobble_nt, metric='cosine')
+    # ---- Pairwise PC silhouette (for PCA best-pair selection) ----
+    sil_pc_indices = [i for i in range(6) if i < centered.shape[1]]
+    if centered.shape[1] > 12:
+        sil_pc_indices.append(12)
+    n_sil = len(sil_pc_indices)
+    pcs_sil = centered @ Vt[sil_pc_indices].T
 
-    # Spearman correlation: purine fraction vs PC1
-    from scipy.stats import spearmanr as _spearmanr
-    rho_pur_pc1, p_pur_pc1 = _spearmanr(purine_fraction, pc[:, 0])
+    sil_matrices = {}
+    for lbl_name, lbl_arr in label_sets:
+        mat = np.full((n_sil, n_sil), np.nan)
+        for i in range(n_sil):
+            for j in range(i + 1, n_sil):
+                mat[i, j] = silhouette_score(pcs_sil[:, [i, j]], lbl_arr)
+        sil_matrices[lbl_name] = mat
 
-    # Extended silhouette analysis on 30 PCs (Euclidean + cosine) — log only
-    n_ext = min(30, len(S))
-    pc_30 = centered @ Vt[:n_ext].T
-    sil_aa_30, sil_aa_30_p = silhouette_with_pvalue(pc_30, aa_label_arr)
-    sil_wob_30, sil_wob_30_p = silhouette_with_pvalue(pc_30, wobble_nt)
-    sil_aa_30c, sil_aa_30c_p = silhouette_with_pvalue(
-        pc_30, aa_label_arr, metric='cosine')
-    sil_wob_30c, sil_wob_30c_p = silhouette_with_pvalue(
-        pc_30, wobble_nt, metric='cosine')
-    logger.info(f"  Silhouette (amino acid):  2 PCs eucl = {sil:.3f} (p={sil_p:.3f})"
-                f"  |  2 PCs cos = {sil_2c:.3f} (p={sil_2c_p:.3f})"
-                f"  |  {n_ext} PCs eucl = {sil_aa_30:.3f} (p={sil_aa_30_p:.3f})"
-                f"  |  {n_ext} PCs cos = {sil_aa_30c:.3f} (p={sil_aa_30c_p:.3f})")
-    logger.info(f"  Silhouette (wobble nt):   2 PCs eucl = {sil_wob:.3f} (p={sil_wob_p:.3f})"
-                f"  |  2 PCs cos = {sil_wob_2c:.3f} (p={sil_wob_2c_p:.3f})"
-                f"  |  {n_ext} PCs eucl = {sil_wob_30:.3f} (p={sil_wob_30_p:.3f})"
-                f"  |  {n_ext} PCs cos = {sil_wob_30c:.3f} (p={sil_wob_30c_p:.3f})")
+    pc_names = [f"PC{idx+1}" for idx in sil_pc_indices]
+    header = "        " + "  ".join(f"{name:>5s}" for name in pc_names)
+    for lbl_name in ('Amino acid', 'Functional group'):
+        logger.info(f"  Pairwise PC silhouette (Euclidean) — {lbl_name}:")
+        logger.info(header)
+        mat = sil_matrices[lbl_name]
+        for i in range(n_sil):
+            vals = ["     " if j <= i else f"{mat[i, j]:5.3f}"
+                    for j in range(n_sil)]
+            logger.info(f"  {pc_names[i]:>4s}  " + "  ".join(vals))
 
-    # Shared plotting helpers
+    def _best_pair(mat):
+        best_val, best_ij = -1.0, (0, 1)
+        for i in range(n_sil):
+            for j in range(i + 1, n_sil):
+                if mat[i, j] > best_val:
+                    best_val = mat[i, j]
+                    best_ij = (i, j)
+        return sil_pc_indices[best_ij[0]], sil_pc_indices[best_ij[1]], best_val
+
+    # Best PC pair per coloring
+    pca_coords = {}
+    pca_labels_xy = {}
+    for lbl_name in ('Amino acid', 'Functional group',
+                     'Wobble nucleotide', 'Purine fraction'):
+        pi, pj, sv = _best_pair(sil_matrices[lbl_name])
+        coords = centered @ Vt[[pi, pj]].T
+        pca_coords[lbl_name] = coords
+        pca_labels_xy[lbl_name] = (
+            f'PC{pi+1} ({all_var[pi]:.1%} var.)',
+            f'PC{pj+1} ({all_var[pj]:.1%} var.)')
+        logger.info(f"  Best PCs for {lbl_name}: "
+                    f"PC{pi+1} vs PC{pj+1} (sil={sv:.3f})")
+
+    # ---- Shared plotting helpers ----
+    _WOBBLE_PALETTE = {
+        'A': COLORS['primary'], 'C': COLORS['secondary'],
+        'G': COLORS['tertiary'], 'T': COLORS['quaternary'],
+    }
+    _FUNC_PALETTE = {
+        'Nonpolar': COLORS['primary'], 'Aromatic': COLORS['secondary'],
+        'Polar': COLORS['tertiary'], 'Positive': COLORS['quaternary'],
+        'Negative': COLORS['quinary'], 'Stop': COLORS['text'],
+    }
+
     def _plot_aa(ax, coords):
         for aa in unique_aa:
             mask = [i for i, a in enumerate(aa_labels) if a == aa]
@@ -535,26 +613,11 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                        label=aa, zorder=3)
         for i, codon in enumerate(codons):
             ax.annotate(codon, (coords[i, 0], coords[i, 1]),
-                        fontsize=FONT_SIZES['overlay_small'], ha='center', va='bottom',
-                        xytext=(0, 3), textcoords='offset points',
-                        color=COLORS['text_light'])
-
-    def _plot_wobble_nt(ax, coords):
-        """Plot codons colored by wobble nucleotide identity (A/C/G/T)."""
-        for nt in ['A', 'C', 'G', 'T']:
-            mask = wobble_nt == nt
-            ax.scatter(coords[mask, 0], coords[mask, 1],
-                       c=_WOBBLE_NT_COLORS[nt], s=50, alpha=0.85,
-                       edgecolors='white', linewidths=0.4, zorder=3,
-                       label=nt)
-        for i, codon in enumerate(codons):
-            ax.annotate(codon, (coords[i, 0], coords[i, 1]),
-                        fontsize=FONT_SIZES['overlay_small'], ha='center', va='bottom',
+                        fontsize=FONT_SIZES['label'], ha='center', va='bottom',
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
 
     def _plot_purine(ax, coords):
-        """Plot codons colored by purine fraction (continuous)."""
         sc = ax.scatter(coords[:, 0], coords[:, 1],
                         c=purine_fraction, cmap='RdYlBu_r',
                         vmin=0, vmax=1,
@@ -562,125 +625,136 @@ def make_embedding_figure(model, out_path: str, dpi: int = 200,
                         edgecolors='white', linewidths=0.4, zorder=3)
         for i, codon in enumerate(codons):
             ax.annotate(codon, (coords[i, 0], coords[i, 1]),
-                        fontsize=FONT_SIZES['overlay_small'], ha='center', va='bottom',
+                        fontsize=FONT_SIZES['label'], ha='center', va='bottom',
                         xytext=(0, 3), textcoords='offset points',
                         color=COLORS['text_light'])
         return sc
 
-    # --- Layout: 1×3 (or 2×3 with MDS) ---
-    nrows = 2 if show_mds else 1
-    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT_ROW * nrows * 0.75))
-    gs = gridspec.GridSpec(nrows, 3, figure=fig, hspace=0.22,
-                           wspace=0.38, left=0.06, right=0.97,
-                           top=0.92, bottom=0.20 if not show_mds else 0.12)
+    def _plot_func(ax, coords):
+        for grp in ['Nonpolar', 'Aromatic', 'Polar',
+                     'Positive', 'Negative', 'Stop']:
+            mask = [i for i, g in enumerate(func_labels) if g == grp]
+            ax.scatter(coords[mask, 0], coords[mask, 1],
+                       c=_FUNC_PALETTE[grp],
+                       s=50, alpha=0.85, edgecolors='white', linewidths=0.4,
+                       label=grp, zorder=3)
+        for i, codon in enumerate(codons):
+            ax.annotate(codon, (coords[i, 0], coords[i, 1]),
+                        fontsize=FONT_SIZES['label'], ha='center', va='bottom',
+                        xytext=(0, 3), textcoords='offset points',
+                        color=COLORS['text_light'])
 
-    # --- Panel A: PCA — amino acid ---
-    ax_pca_aa = fig.add_subplot(gs[0, 0])
-    _plot_aa(ax_pca_aa, pc)
-    ax_pca_aa.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
-    ax_pca_aa.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
-    ax_pca_aa.set_title('PCA — amino acid')
-    p_str = f'{sil_p:.1e}' if sil_p < 0.001 else f'{sil_p:.3f}'
-    p_aa30_str = f'{sil_aa_30c_p:.1e}' if sil_aa_30c_p < 0.001 else f'{sil_aa_30c_p:.3f}'
-    ax_pca_aa.text(0.97, 0.97,
-                   f'Silhouette scores:\n'
-                   f'  2 PCs: {sil:.3f} (p = {p_str})\n'
-                   f'  30 PCs: {sil_aa_30c:.3f} (p = {p_aa30_str})',
-                   transform=ax_pca_aa.transAxes,
-                   fontsize=FONT_SIZES['overlay'], color=COLORS['text'],
-                   va='top', ha='right')
+    def _plot_wobble(ax, coords):
+        for nuc in ['A', 'C', 'G', 'T']:
+            mask = [i for i, w in enumerate(wobble_nuc) if w == nuc]
+            ax.scatter(coords[mask, 0], coords[mask, 1],
+                       c=_WOBBLE_PALETTE[nuc],
+                       s=50, alpha=0.85, edgecolors='white', linewidths=0.4,
+                       label=nuc, zorder=3)
+        for i, codon in enumerate(codons):
+            ax.annotate(codon, (coords[i, 0], coords[i, 1]),
+                        fontsize=FONT_SIZES['label'], ha='center', va='bottom',
+                        xytext=(0, 3), textcoords='offset points',
+                        color=COLORS['text_light'])
 
-    # --- Panel B: PCA — wobble nucleotide identity ---
-    ax_pca_wob = fig.add_subplot(gs[0, 1])
-    _plot_wobble_nt(ax_pca_wob, pc)
-    ax_pca_wob.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
-    ax_pca_wob.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
-    ax_pca_wob.set_title('PCA — wobble nucleotide (3rd pos.)')
-    p_wob_str = f'{sil_wob_p:.1e}' if sil_wob_p < 0.001 else f'{sil_wob_p:.3f}'
-    p_wob30_str = f'{sil_wob_30c_p:.1e}' if sil_wob_30c_p < 0.001 else f'{sil_wob_30c_p:.3f}'
-    ax_pca_wob.text(0.97, 0.97,
-                    f'Silhouette scores:\n'
-                    f'  2 PCs: {sil_wob:.3f} (p = {p_wob_str})\n'
-                    f'  30 PCs: {sil_wob_30c:.3f} (p = {p_wob30_str})',
-                    transform=ax_pca_wob.transAxes,
-                    fontsize=FONT_SIZES['overlay'], color=COLORS['text'],
-                    va='top', ha='right')
+    def _add_sil_text(ax, coords, lbl_arr):
+        sil_val, sil_p = silhouette_with_pvalue(coords, lbl_arr)
+        p_str = f'{sil_p:.1e}' if sil_p < 0.001 else f'{sil_p:.3f}'
+        ax.text(0.97, 0.97, f'Silhouette = {sil_val:.3f}\np = {p_str}',
+                transform=ax.transAxes,
+                fontsize=FONT_SIZES['label'], color=COLORS['text'],
+                va='top', ha='right')
 
-    # --- Panel C: PCA — purine fraction ---
-    ax_pca_pur = fig.add_subplot(gs[0, 2])
-    sc = _plot_purine(ax_pca_pur, pc)
-    ax_pca_pur.set_xlabel(f'PC1 ({var_explained[0]:.1%} var.)')
-    ax_pca_pur.set_ylabel(f'PC2 ({var_explained[1]:.1%} var.)')
-    ax_pca_pur.set_title('PCA — purine fraction')
-    p_pur_str = f'{p_pur_pc1:.1e}' if p_pur_pc1 < 0.001 else f'{p_pur_pc1:.3f}'
-    ax_pca_pur.text(0.97, 0.97,
-                    f'PC1 ρ = {rho_pur_pc1:.3f}\np = {p_pur_str}',
-                    transform=ax_pca_pur.transAxes,
-                    fontsize=FONT_SIZES['overlay'], color=COLORS['text'],
-                    va='top', ha='right')
+    # Panel specification: (name, plot_func, label_arr, title_suffix, has_cbar)
+    panel_specs = [
+        ('Amino acid',        _plot_aa,     aa_label_arr,      'amino acid',        False),
+        ('Purine fraction',   _plot_purine, purine_labels,     'purine fraction',   True),
+        ('Functional group',  _plot_func,   func_labels,       'functional group',  False),
+        ('Wobble nucleotide', _plot_wobble, wobble_label_arr,  'wobble nucleotide', False),
+    ]
 
-    all_axes = [ax_pca_aa, ax_pca_wob, ax_pca_pur]
+    def _make_4panel(method_name, coords_per_panel, xlabels, ylabels,
+                     out_path, suptitle_extra=''):
+        """Create one 2x2 figure with 4 colorings."""
+        fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+        gs_fig = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38,
+                                   wspace=0.32, left=0.07, right=0.97,
+                                   top=0.93, bottom=0.07)
+        axes = []
+        for pi, (lbl_name, plot_fn, lbl_arr, title_sfx, has_cbar) in \
+                enumerate(panel_specs):
+            row, col = divmod(pi, 2)
+            ax = fig.add_subplot(gs_fig[row, col])
+            coords = coords_per_panel[lbl_name]
+            result = plot_fn(ax, coords)
+            ax.set_xlabel(xlabels[lbl_name])
+            ax.set_ylabel(ylabels[lbl_name])
+            ax.set_title(f'{method_name} — {title_sfx}')
+            _add_sil_text(ax, coords, lbl_arr)
+            if has_cbar and result is not None:
+                cbar_ax = inset_axes(ax, width="4%", height="50%",
+                                     loc='lower right', borderpad=1.5)
+                fig.colorbar(result, cax=cbar_ax).set_label(
+                    'Purine frac.', fontsize=FONT_SIZES['label'])
+            if lbl_name == 'Functional group':
+                ax.legend(loc='best', frameon=True, framealpha=0.9,
+                          edgecolor=COLORS['grid'],
+                          fontsize=FONT_SIZES['label'])
+            if lbl_name == 'Wobble nucleotide':
+                ax.legend(loc='best', frameon=True, framealpha=0.9,
+                          edgecolor=COLORS['grid'],
+                          fontsize=FONT_SIZES['label'],
+                          title='3rd position')
+            axes.append(ax)
 
-    # Row 1: MDS (cosine) — optional
-    if show_mds:
-        ax_mds_aa = fig.add_subplot(gs[1, 0])
-        _plot_aa(ax_mds_aa, mds)
-        ax_mds_aa.set_xlabel('MDS dim 1')
-        ax_mds_aa.set_ylabel('MDS dim 2')
-        ax_mds_aa.set_title('MDS (cosine) — amino acid')
-        ax_mds_aa.text(0.03, 0.97, f'Stress-1 = {stress:.3f}',
-                       transform=ax_mds_aa.transAxes,
-                       fontsize=FONT_SIZES['overlay'],
-                       color=COLORS['text'], va='top')
+        _add_panel_letters(axes, 'ABCD', x=-0.06, y=1.06)
 
-        ax_mds_wob = fig.add_subplot(gs[1, 1])
-        _plot_wobble_nt(ax_mds_wob, mds)
-        ax_mds_wob.set_xlabel('MDS dim 1')
-        ax_mds_wob.set_ylabel('MDS dim 2')
-        ax_mds_wob.set_title('MDS (cosine) — wobble nucleotide')
+        # Shared amino acid legend below
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, ncol=7,
+                   loc='lower center', bbox_to_anchor=(0.5, -0.02),
+                   frameon=True, framealpha=0.9, edgecolor=COLORS['grid'],
+                   handletextpad=0.4)
 
-        ax_mds_pur = fig.add_subplot(gs[1, 2])
-        sc_mds = _plot_purine(ax_mds_pur, mds)
-        ax_mds_pur.set_xlabel('MDS dim 1')
-        ax_mds_pur.set_ylabel('MDS dim 2')
-        ax_mds_pur.set_title('MDS (cosine) — purine fraction')
+        embed_dim = codon_embs.shape[1]
+        sil_aa_30 = sil_30pc['Amino acid']
+        title = (f'Learned codon embeddings — {method_name}  '
+                 f'({embed_dim}-dim, AA sil = {sil_aa_30:.3f} '
+                 f'@ {n_sil_pcs} PCs{suptitle_extra})')
+        _suptitle(fig, title, y=0.97)
+        _save_figure(fig, out_path, dpi=dpi)
 
-        all_axes += [ax_mds_aa, ax_mds_wob, ax_mds_pur]
+    # ==== Figure 1: PCA ====
+    logger.info("  Generating PCA figure ...")
+    pca_xlabels = {k: v[0] for k, v in pca_labels_xy.items()}
+    pca_ylabels = {k: v[1] for k, v in pca_labels_xy.items()}
+    _make_4panel('PCA', pca_coords, pca_xlabels, pca_ylabels,
+                 _output_path(os.path.join(out_dir, 'embeddings_pca.png')))
 
-    # Panel labels
-    _add_panel_letters(all_axes, 'ABCDEF', x=-0.06, y=1.06)
+    # ==== Figure 2: UMAP (cosine) ====
+    logger.info("  Generating UMAP figure ...")
+    import umap
+    reducer = umap.UMAP(n_components=2, metric='cosine', random_state=42)
+    umap_coords = reducer.fit_transform(codon_embs)
+    umap_dict = {k: umap_coords for k, _, _, _, _ in panel_specs}
+    umap_lbl = {k: ('UMAP dim 1', 'UMAP dim 2') for k in umap_dict}
+    _make_4panel('UMAP (cosine)', umap_dict,
+                 {k: v[0] for k, v in umap_lbl.items()},
+                 {k: v[1] for k, v in umap_lbl.items()},
+                 _output_path(os.path.join(out_dir, 'embeddings_umap.png')))
 
-    # --- Bottom legends row ---
-    # Amino acid legend (left, 2 rows)
-    handles_aa, labels_aa = ax_pca_aa.get_legend_handles_labels()
-    n_aa = len(handles_aa)
-    ncol_aa = (n_aa + 1) // 2   # 2 rows
-    fig.legend(handles_aa, labels_aa, ncol=ncol_aa,
-               loc='lower left', bbox_to_anchor=(0.06, 0.0),
-               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'],
-               handletextpad=0.3, columnspacing=0.8)
-
-    # Purine fraction colorbar (center-right, horizontal)
-    cbar_ax = fig.add_axes([0.58, 0.06, 0.15, 0.018])
-    cbar = fig.colorbar(sc, cax=cbar_ax, orientation='horizontal')
-    cbar.set_label('Purine fraction', fontsize=FONT_SIZES['legend'])
-
-    # Wobble nucleotide legend (right)
-    handles_wob, labels_wob = ax_pca_wob.get_legend_handles_labels()
-    fig.legend(handles_wob, labels_wob, ncol=2,
-               loc='lower right', bbox_to_anchor=(0.97, 0.0),
-               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'],
-               handletextpad=0.3, columnspacing=0.8)
-
-    embed_dim = codon_embs.shape[1]
-    title = (f'Learned codon embeddings  ({embed_dim}-dim,  '
-             f'AA silhouette = {sil:.3f} @ 2 PCs, p = {p_str}')
-    if show_mds:
-        title += f',  MDS cosine stress = {stress:.3f}'
-    title += ')'
-    _suptitle(fig, title, y=0.97)
-
-    _save_figure(fig, out_path, dpi=dpi)
+    # ==== Figure 3: t-SNE (cosine) ====
+    logger.info("  Generating t-SNE figure ...")
+    from sklearn.manifold import TSNE
+    tsne = TSNE(n_components=2, metric='cosine', perplexity=15,
+                random_state=42, init='random')
+    tsne_coords = tsne.fit_transform(codon_embs)
+    tsne_dict = {k: tsne_coords for k, _, _, _, _ in panel_specs}
+    tsne_lbl = {k: ('t-SNE dim 1', 't-SNE dim 2') for k in tsne_dict}
+    _make_4panel('t-SNE (cosine)', tsne_dict,
+                 {k: v[0] for k, v in tsne_lbl.items()},
+                 {k: v[1] for k, v in tsne_lbl.items()},
+                 _output_path(os.path.join(out_dir, 'embeddings_tsne.png')))
 
 
 # ---------------------------------------------------------------------------
@@ -900,8 +974,6 @@ def make_codon_property_correlation(model, out_path: str,
     properties are shown.  P-values are FDR-corrected (Benjamini-Hochberg).
     """
     from scipy.stats import spearmanr
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    from scipy.spatial.distance import pdist
     setup_style()
 
     # Extract embeddings
@@ -970,55 +1042,55 @@ def make_codon_property_correlation(model, out_path: str,
         df.to_csv(tsv_path, sep='\t', index=False)
         logger.info(f"Codon property correlations: {tsv_path}")
 
-    # Cluster properties by correlation profile
-    if n_props > 2:
-        row_dist = pdist(rho_matrix, metric='correlation')
-        row_dist = np.nan_to_num(row_dist, nan=1.0)
-        row_link = linkage(row_dist, method='average')
-        row_order = leaves_list(row_link)
-    else:
-        row_order = np.arange(n_props)
+    # Variance explained by each property:
+    # Σ_k (ρ_jk² × var_explained_k) — weighted sum of squared correlations,
+    # where weights are the fraction of total embedding variance captured
+    # by each PC.  This estimates how much of the embedding's variance
+    # structure is linearly associated with each property.
+    prop_var_explained = (rho_matrix ** 2) @ var_explained  # (n_props,)
+
+    for i, name in enumerate(prop_names):
+        logger.info(f"    {name:25s}: {prop_var_explained[i]:.4f}")
+
+    # Order rows: group by category, within each group sort by
+    # variance explained (descending)
+    group_order = ['Sequence', 'Amino acid', 'Degeneracy']
+    row_order = []
+    for grp in group_order:
+        grp_indices = [i for i, n in enumerate(prop_names)
+                       if prop_group(n) == grp]
+        grp_indices.sort(key=lambda i: prop_var_explained[i], reverse=True)
+        row_order.extend(grp_indices)
+    # Append any remaining (e.g. 'Other') at the end
+    seen = set(row_order)
+    for i in range(n_props):
+        if i not in seen:
+            row_order.append(i)
 
     rho_ordered = rho_matrix[row_order]
     fdr_ordered = fdr_matrix[row_order]
     names_ordered = [prop_names[i] for i in row_order]
+    var_exp_ordered = prop_var_explained[row_order]
 
-    # ---- Compute variance-weighted R² per property ----
-    from scipy.stats import pearsonr as _pearsonr
-    all_var_full = S ** 2 / (S ** 2).sum()
-    n_all_pcs = len(S)
-    pcs_full = centered @ Vt[:n_all_pcs].T
-    weighted_r2 = np.zeros(n_props)
-    for i in range(n_props):
-        if prop_matrix[:, i].std() < 1e-12:
-            continue
-        for j in range(n_all_pcs):
-            r, _ = _pearsonr(prop_matrix[:, i], pcs_full[:, j])
-            weighted_r2[i] += all_var_full[j] * r ** 2
-    # Reorder to match clustered heatmap rows
-    wr2_ordered = weighted_r2[row_order]
-
-    logger.info(f"  Variance-weighted R² (all {n_props} properties): "
-                f"{weighted_r2.sum() * 100:.1f}%")
-
-    # --- Figure: variance bars on top + heatmap + R² side panel ---
-    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+    # --- Figure: PC variance bars on top + heatmap + property variance strip ---
+    fig = plt.figure(figsize=(FIG_WIDTH, 1.5 * FIG_HEIGHT_ROW))
     gs = gridspec.GridSpec(2, 2, figure=fig,
-                           height_ratios=[1, 6], width_ratios=[6, 1],
-                           hspace=0.05, wspace=0.05,
+                           height_ratios=[1, 6],
+                           width_ratios=[20, 2],
+                           hspace=0.05, wspace=0.08,
                            left=0.22, right=0.88,
                            top=0.93, bottom=0.06)
 
-    # Variance explained bar chart (top-left, spans heatmap columns)
+    # Variance explained bar chart (top, spans heatmap column only)
     ax_var = fig.add_subplot(gs[0, 0])
     ax_var.bar(range(n_pcs), var_explained * 100, color=COLORS['primary'],
                alpha=0.7, width=0.8, edgecolor='none')
     ax_var.set_xlim(-0.5, n_pcs - 0.5)
     ax_var.set_ylabel('% var.')
-    ax_var.tick_params(axis='x', labelbottom=False)
+    ax_var.tick_params(axis='x', bottom=False, labelbottom=False)
     ax_var.set_title('Codon properties vs. learned embedding PCs', pad=8)
 
-    # Heatmap (bottom-left)
+    # Heatmap (bottom left)
     ax_heat = fig.add_subplot(gs[1, 0])
     im = ax_heat.imshow(rho_ordered, aspect='auto', cmap='RdBu_r',
                         vmin=-1, vmax=1, interpolation='nearest')
@@ -1035,6 +1107,15 @@ def make_codon_property_correlation(model, out_path: str,
         ax_heat.get_yticklabels()[yi].set_color(
             PROPERTY_GROUP_COLORS.get(grp, '#333'))
 
+    # Group separator lines
+    y_pos = 0
+    for grp in group_order:
+        n_in_grp = sum(1 for n in names_ordered if prop_group(n) == grp)
+        if n_in_grp > 0 and y_pos > 0:
+            ax_heat.axhline(y_pos - 0.5, color=COLORS['grid'],
+                            linewidth=1.0, linestyle='-')
+        y_pos += n_in_grp
+
     # Significance stars (FDR-corrected)
     for i in range(n_props):
         for j in range(n_pcs):
@@ -1044,40 +1125,36 @@ def make_codon_property_correlation(model, out_path: str,
             stars = '***' if q < 0.001 else ('**' if q < 0.01 else '*')
             color = 'white' if abs(rho_ordered[i, j]) > 0.6 else 'black'
             ax_heat.text(j, i, stars, ha='center', va='center',
-                        fontsize=4, color=color)
+                        fontsize=FONT_SIZES['label'], color=color)
 
     ax_heat.set_xlabel('Principal component')
 
-    # Variance-weighted R² side panel (bottom-right)
-    ax_r2 = fig.add_subplot(gs[1, 1], sharey=ax_heat)
-    ax_r2.barh(np.arange(n_props), wr2_ordered * 100,
-               color=[PROPERTY_GROUP_COLORS.get(prop_group(names_ordered[i]), '#999')
-                      for i in range(n_props)],
-               edgecolor='none', height=0.8)
-    ax_r2.set_xlabel('Var. expl. (%)')
-    ax_r2.tick_params(axis='y', labelleft=False)
-    ax_r2.set_ylim(-0.5, n_props - 0.5)
-
-    # Hide top-right cell
-    ax_blank = fig.add_subplot(gs[0, 1])
-    ax_blank.set_axis_off()
+    # Property variance explained strip (bottom right)
+    ax_pvar = fig.add_subplot(gs[1, 1], sharey=ax_heat)
+    ax_pvar.barh(range(n_props), var_exp_ordered,
+                 color=[PROPERTY_GROUP_COLORS.get(prop_group(n), '#999')
+                        for n in names_ordered],
+                 alpha=0.8, height=0.8, edgecolor='none')
+    ax_pvar.set_xlabel('Var. expl.')
+    ax_pvar.tick_params(axis='y', left=False, labelleft=False)
+    ax_pvar.set_ylim(n_props - 0.5, -0.5)
 
     # Colorbar
-    cbar_ax = fig.add_axes([0.90, 0.06, 0.012, 0.55])
+    cbar_ax = fig.add_axes([0.91, 0.06, 0.012, 0.55])
     cb = fig.colorbar(im, cax=cbar_ax)
-    cb.set_label('Spearman \u03c1', fontsize=FONT_SIZES['legend'])
+    cb.set_label('Spearman \u03c1', fontsize=FONT_SIZES['label'])
 
     # Legend
     from matplotlib.patches import Patch
     legend_patches = [Patch(facecolor=PROPERTY_GROUP_COLORS[g], label=g)
                       for g in PROPERTY_GROUP_COLORS]
     fig.legend(handles=legend_patches,
-               loc='lower left', bbox_to_anchor=(0.01, 0.01), ncol=3,
+               loc='upper right', bbox_to_anchor=(0.99, 0.99), ncol=1,
                frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
 
     _suptitle(fig,
         f'Spearman \u03c1  (* q<.05  ** q<.01  *** q<.001, BH-corrected)',
-        y=0.98, fontsize=FONT_SIZES['overlay'])
+        y=0.98, fontsize=FONT_SIZES['label'])
 
     _save_figure(fig, out_path, dpi=dpi)
 
@@ -1102,7 +1179,7 @@ def make_codon_property_correlation(model, out_path: str,
 
 def plot_support_rank_curves(ax, level_results: Dict[str, Dict],
                              real_support: Optional[Dict[str, np.ndarray]] = None):
-    """Normalized support vs. normalized rank for all taxonomic levels."""
+    """Support vs. rank (log-log) for all taxonomic levels."""
     palette = [COLORS['primary'], COLORS['secondary'], COLORS['tertiary'],
                COLORS['quaternary'], COLORS['quinary'], COLORS['senary']]
 
@@ -1123,11 +1200,10 @@ def plot_support_rank_curves(ax, level_results: Dict[str, Dict],
                 color=palette[i % len(palette)], linewidth=1.5,
                 label=f'{level_name} (n={n})')
 
+    ax.set_yscale('log')
     ax.set_xlabel('Normalized rank')
     ax.set_ylabel('Normalized support (fraction of max)')
     ax.set_title('Host category support')
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1.05)
     ax.legend(loc='upper right')
     ax.grid(alpha=0.3)
 
@@ -1167,7 +1243,7 @@ def plot_top_genera(ax, level_results: Dict[str, Dict],
     # Value labels
     for yi, val in zip(y, top_sup):
         ax.text(val + top_sup.max() * 0.01, yi, f'{val:.0f}',
-                va='center', fontsize=FONT_SIZES['overlay'],
+                va='center', fontsize=FONT_SIZES['label'],
                 color=COLORS['text_light'])
 
     ax.grid(alpha=0.3, axis='x')
@@ -1239,7 +1315,12 @@ def make_dataset_figure(level_results: Dict[str, Dict],
     """Support distributions, top genera, and unique proteins vs support."""
     setup_style()
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW))
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32,
+                           left=0.07, right=0.97, top=0.93, bottom=0.07)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[1, 0])
 
     plot_support_rank_curves(ax1, level_results, real_support)
     plot_top_genera(ax2, level_results, real_support, top_n=20)
@@ -1255,8 +1336,7 @@ def make_dataset_figure(level_results: Dict[str, Dict],
 
     _add_panel_letters([ax1, ax2, ax3], 'ABC', x=-0.08, y=1.06)
 
-    _suptitle(fig, 'Dataset overview', y=1.01)
-    fig.tight_layout()
+    _suptitle(fig, 'Dataset overview', y=0.98)
     _save_figure(fig, out_path, dpi=dpi)
 
 
@@ -1272,27 +1352,31 @@ def make_training_figure(history: Optional[pd.DataFrame],
     setup_style()
 
     has_history = history is not None and len(history) > 0
-    ncols = 3 if has_history else 1
 
-    fig, axes = plt.subplots(1, ncols, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW))
-    if ncols == 1:
-        axes = [axes]
-
-    col = 0
     if has_history:
-        plot_loss_curves(axes[0], history)
-        plot_f1_curves(axes[1], history)
-        col = 2
+        fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32,
+                               left=0.07, right=0.97, top=0.93, bottom=0.07)
+        ax_loss = fig.add_subplot(gs[0, 0])
+        ax_f1   = fig.add_subplot(gs[0, 1])
+        ax_cal  = fig.add_subplot(gs[1, 0])
 
-    plot_calibration(axes[col], logits, labels, temperature)
+        plot_loss_curves(ax_loss, history)
+        plot_f1_curves(ax_f1, history)
+        plot_calibration(ax_cal, logits, labels, temperature)
 
-    _add_panel_letters(axes, 'ABC', x=-0.08, y=1.06)
+        axes = [ax_loss, ax_f1, ax_cal]
+        _add_panel_letters(axes, 'ABC', x=-0.08, y=1.06)
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(FIG_WIDTH / 2, FIG_HEIGHT_ROW))
+        plot_calibration(ax, logits, labels, temperature)
+        _add_panel_letters([ax], 'A', x=-0.08, y=1.06)
 
     _suptitle(fig,
               f'Training summary  (T = {temperature:.3f}, '
               f'threshold = {threshold:.3f})',
-              y=1.01)
-    fig.tight_layout()
+              y=0.98)
+
     _save_figure(fig, out_path, dpi=dpi)
 
 
@@ -1474,7 +1558,6 @@ def _plot_pr_panel(ax, probs_per_level, labels_per_level, level_names,
     ax.legend(loc='lower left',
               frameon=True, framealpha=0.9, edgecolor=COLORS['grid'])
     ax.grid(alpha=0.3, linestyle='--')
-    ax.set_aspect('equal')
 
 
 def make_pr_figure(logits: torch.Tensor, labels: torch.Tensor,
@@ -1534,33 +1617,39 @@ def make_pr_figure(logits: torch.Tensor, labels: torch.Tensor,
                 probs_blocked[name] = agg_p
                 labels_blocked[name] = agg_l
 
-    # --- Figure: 1×3 ---
+    # --- Figure: 2×2 ---
     n_panels = 3 if has_blocked else 2
-    fig, axes = plt.subplots(1, n_panels, figsize=(FIG_WIDTH, FIG_HEIGHT_ROW),
-                             squeeze=False)
-    axes = axes[0]
+    fig = plt.figure(figsize=(FIG_WIDTH, 2 * FIG_HEIGHT_ROW))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32,
+                           left=0.07, right=0.97, top=0.93, bottom=0.07)
 
-    _plot_pr_panel(axes[0], probs_per_level, labels_per_level,
+    ax_micro = fig.add_subplot(gs[0, 0])
+    ax_macro = fig.add_subplot(gs[0, 1])
+
+    _plot_pr_panel(ax_micro, probs_per_level, labels_per_level,
                    level_names_present, 'Micro-averaged precision–recall',
                    temperature, averaging='micro')
 
-    _plot_pr_panel(axes[1], probs_per_level, labels_per_level,
+    _plot_pr_panel(ax_macro, probs_per_level, labels_per_level,
                    level_names_present, 'Macro-averaged precision–recall',
                    temperature, averaging='macro')
 
+    axes = [ax_micro, ax_macro]
+
     if has_blocked:
+        ax_blocked = fig.add_subplot(gs[1, 0])
         n_blocked = len(blocked_classes)
         n_kept = int(keep_mask.sum())
-        _plot_pr_panel(axes[2], probs_blocked, labels_blocked,
+        _plot_pr_panel(ax_blocked, probs_blocked, labels_blocked,
                        level_names_present,
                        f'Macro-averaged PR\n({n_blocked} blocked classes removed, '
                        f'{n_kept} kept)',
                        temperature, averaging='macro')
+        axes.append(ax_blocked)
 
     letters = 'ABC'[:n_panels]
     _add_panel_letters(axes, letters, x=-0.08, y=1.06)
 
-    fig.tight_layout()
     _save_figure(fig, out_path, dpi=dpi)
 
 
@@ -1588,8 +1677,6 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dpi', type=int, default=200)
-    parser.add_argument('--mds', action='store_true',
-                        help='Include MDS panels in embedding figure')
     parser.add_argument('--presentation', action='store_true',
                         help='Increase font sizes for presentations and '
                              'remove panel letters')
@@ -1668,7 +1755,7 @@ def main():
 
     # ---- build val loader ------------------------------------------------
     tokenizer = CodonTokenizer()
-    eval_stride = args.eval_stride or calib.get('eval_stride') or patch_nt_len // 2
+    eval_stride = args.eval_stride or patch_nt_len // 2
     val_ds = PatchSequenceDataset(
         val_seqs, val_labels, tokenizer,
         patch_nt_len=patch_nt_len, max_patches=args.max_patches,
@@ -1725,12 +1812,12 @@ def main():
         out_path=_output_path(os.path.join(plot_dir, 'evaluation.png')),
         dpi=args.dpi)
 
-    # ---- Figure 3: Codon embedding PCA -----------------------------------
-    logger.info("Generating embedding PCA figure ...")
-    make_embedding_figure(
+    # ---- Figure 3: Codon embedding visualizations -------------------------
+    logger.info("Generating embedding figures (PCA, UMAP, t-SNE) ...")
+    make_embedding_figures(
         model,
-        out_path=_output_path(os.path.join(plot_dir, 'embeddings.png')),
-        dpi=args.dpi, show_mds=args.mds)
+        out_dir=plot_dir,
+        dpi=args.dpi)
 
     # ---- Figure 3b: Codon property × PC correlation (supplementary) ------
     logger.info("Generating codon property–PC correlation figure ...")
