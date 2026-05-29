@@ -33,7 +33,7 @@ from eval_utils import (
     setup_style, _add_panel_letters, _output_path, _suptitle,
     _save_figure, enable_presentation_mode,
     collect_logits, evaluate_all_levels, compute_real_support,
-    parse_lineages, aggregate_to_level,
+    parse_lineages, aggregate_to_level, build_temperature_vector,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ def plot_f1_curves(ax, history: pd.DataFrame):
 
 
 def plot_calibration(ax, logits: torch.Tensor, labels: torch.Tensor,
-                     temperature: float, n_bins: int = 15):
+                     temperature, n_bins: int = 15):
     """Reliability diagram for calibrated probabilities."""
     probs = torch.sigmoid(logits / temperature).numpy().ravel()
     truth = labels.numpy().ravel()
@@ -1346,7 +1346,7 @@ def make_dataset_figure(level_results: Dict[str, Dict],
 
 def make_training_figure(history: Optional[pd.DataFrame],
                          logits: torch.Tensor, labels: torch.Tensor,
-                         temperature: float, threshold: float,
+                         temperature, threshold: float,
                          out_path: str, dpi: int = 200):
     """Loss curves, validation F1, and calibration diagram."""
     setup_style()
@@ -1387,7 +1387,7 @@ def make_training_figure(history: Optional[pd.DataFrame],
 def make_evaluation_figure(level_results: Dict[str, Dict],
                            metadata_df: Optional[pd.DataFrame],
                            logits: torch.Tensor, labels: torch.Tensor,
-                           temperature: float, threshold: float,
+                           temperature, threshold: float,
                            real_support: Optional[Dict[str, np.ndarray]] = None,
                            out_path: str = 'evaluation.png', dpi: int = 200):
     """Taxonomic metrics, F1 distributions, support vs F1, distance panel."""
@@ -1561,7 +1561,7 @@ def _plot_pr_panel(ax, probs_per_level, labels_per_level, level_names,
 
 
 def make_pr_figure(logits: torch.Tensor, labels: torch.Tensor,
-                   hosts: List[str], temperature: float,
+                   hosts: List[str], temperature,
                    blocked_classes: Optional[List[int]] = None,
                    out_path: str = 'precision_recall.png',
                    dpi: int = 200):
@@ -1699,7 +1699,7 @@ def main():
 
     # ---- load model and calibration --------------------------------------
     model, calib = load_model_and_calibration(args.model_dir, args.checkpoint, device)
-    temperature = calib['temperature']
+    temperature = build_temperature_vector(calib)
     hosts = np.array(calib['hosts'])
     patch_nt_len = calib['model_config']['patch_nt_len']
     blocked_classes = calib.get('blocked_classes', [])

@@ -1704,10 +1704,20 @@ def _run_inference(args, tsv_path: str, scores_path: str,
 
     patch_nt_len = calib['model_config']['patch_nt_len']
     stride = patch_nt_len  # non-overlapping for speed
-    temperature = calib.get('temperature', 1.0)
     host_names = calib['hosts']
     num_classes = len(host_names)
     tokenizer = CodonTokenizer()
+
+    # Build per-class temperature vector when split temperatures are available
+    has_bact = num_classes > 0 and host_names[-1] == 'bacterial_fragment'
+    if calib.get('temperature_host') is not None and has_bact:
+        T_host = calib['temperature_host']
+        T_bact = calib.get('temperature_bacterial', T_host)
+        temperature = torch.ones(num_classes)
+        temperature[:num_classes - 1] = T_host
+        temperature[num_classes - 1:] = T_bact
+    else:
+        temperature = calib.get('temperature', 1.0)
 
     logger.info(f"Model loaded: {num_classes} classes, "
                 f"patch_nt_len={patch_nt_len}")

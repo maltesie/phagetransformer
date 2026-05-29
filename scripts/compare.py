@@ -28,6 +28,7 @@ from eval_utils import (
     COLORS, LEVEL_NAMES, FONT_SIZES, FIG_WIDTH, FIG_HEIGHT_ROW,
     setup_style, _suptitle, _save_figure, enable_presentation_mode,
     load_test_with_ids, predict_test_for_comparison,
+    build_temperature_vector,
 )
 
 logger = logging.getLogger(__name__)
@@ -642,7 +643,7 @@ def main():
     # ---- load model ------------------------------------------------------
     model, calib = load_model_and_calibration(
         args.model_dir, args.checkpoint, device)
-    temperature = calib['temperature']
+    temperature = build_temperature_vector(calib)
     hosts = np.array(calib['hosts'])
     patch_nt_len = calib['model_config']['patch_nt_len']
 

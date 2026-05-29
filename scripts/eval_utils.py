@@ -242,9 +242,29 @@ def load_test_with_ids(ts_path: str, hosts: np.ndarray
     return seq_ids, seqs, datasets, labels
 
 
+def build_temperature_vector(calib: dict):
+    """Build a per-class temperature (scalar or tensor) from calibration.
+
+    Returns a ``(C,)`` tensor when split host/bacterial temperatures are
+    available, otherwise the scalar float for backward compatibility.
+    """
+    hosts = calib['hosts']
+    n_classes = calib['model_config']['num_classes']
+    has_bact = len(hosts) > 0 and hosts[-1] == 'bacterial_fragment'
+    if calib.get('temperature_host') is not None and has_bact:
+        T_host = calib['temperature_host']
+        T_bact = calib.get('temperature_bacterial', T_host)
+        n_host = n_classes - 1
+        temperature = torch.ones(n_classes)
+        temperature[:n_host] = T_host
+        temperature[n_host:] = T_bact
+        return temperature
+    return calib['temperature']
+
+
 def predict_test_for_comparison(
         model, seqs: List[str], seq_ids: List[str],
-        hosts: np.ndarray, temperature: float,
+        hosts: np.ndarray, temperature,
         tokenizer, device: torch.device,
         patch_nt_len: int = 4096, max_patches: int = 512,
         eval_stride: Optional[int] = None,
@@ -387,7 +407,7 @@ def compute_level_metrics(probs: torch.Tensor, labels: torch.Tensor,
 
 
 def evaluate_all_levels(logits: torch.Tensor, labels: torch.Tensor,
-                        hosts: List[str], temperature: float,
+                        hosts: List[str], temperature,
                         threshold: float) -> Dict[str, Dict]:
     """Compute metrics at every taxonomic level."""
     probs = torch.sigmoid(logits / temperature)

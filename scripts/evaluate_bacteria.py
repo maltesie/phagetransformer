@@ -40,6 +40,7 @@ from eval_utils import (
     setup_style, _add_panel_letters, _output_path, _suptitle,
     _save_figure, enable_presentation_mode,
     collect_logits, parse_lineages, aggregate_to_level,
+    build_temperature_vector,
 )
 
 logger = logging.getLogger(__name__)
@@ -276,14 +277,13 @@ def run_chimera_experiment(model, phage_seqs, phage_labels, hosts,
     logits, meta_labels = collect_logits(model, loader, device)
 
     # Extract bacterial_fragment logit and genus logits
-    bact_logits = logits[:, bact_idx]
-    bact_scores = torch.sigmoid(bact_logits / temperature).numpy()
+    all_probs = torch.sigmoid(logits / temperature)
+    bact_scores = all_probs[:, bact_idx].numpy()
     ratios_out = meta_labels[:, 0].numpy()
     true_genus_indices = meta_labels[:, 1].long()
 
     # Check genus prediction correctness: true genus prob above threshold
-    genus_logits = logits[:, :n_genus_classes]
-    genus_probs = torch.sigmoid(genus_logits / temperature)
+    genus_probs = all_probs[:, :n_genus_classes]
 
     genus_correct = []
     genus_prob_vals = []
@@ -648,7 +648,7 @@ def main():
     # ---- load model and calibration --------------------------------------
     model, calib = load_model_and_calibration(
         args.model_dir, args.checkpoint, device)
-    temperature = calib['temperature']
+    temperature = build_temperature_vector(calib)
     hosts = np.array(calib['hosts'])
     patch_nt_len = calib['model_config']['patch_nt_len']
 
@@ -722,8 +722,13 @@ def main():
     )
 
     # ---- convert to probs ------------------------------------------------
-    genus_probs_b = torch.sigmoid(genus_logits_b / temperature)
-    bact_probs_b = torch.sigmoid(bact_logits_b / temperature)
+    if isinstance(temperature, torch.Tensor):
+        genus_probs_b = torch.sigmoid(
+            genus_logits_b / temperature[:genus_logits_b.shape[1]])
+        bact_probs_b = torch.sigmoid(bact_logits_b / temperature[-1])
+    else:
+        genus_probs_b = torch.sigmoid(genus_logits_b / temperature)
+        bact_probs_b = torch.sigmoid(bact_logits_b / temperature)
 
     # ---- log summary stats -----------------------------------------------
     n_bact = len(bact_probs_b)

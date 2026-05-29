@@ -231,9 +231,20 @@ def main():
 
     patch_nt_len = calib['model_config']['patch_nt_len']
     stride = patch_nt_len
-    temperature = calib.get('temperature', 1.0)
     host_names = calib['hosts']
     tokenizer = CodonTokenizer()
+
+    # Build per-class temperature vector when split temperatures are available
+    n_classes = calib['model_config']['num_classes']
+    has_bact = len(host_names) > 0 and host_names[-1] == 'bacterial_fragment'
+    if calib.get('temperature_host') is not None and has_bact:
+        T_host = calib['temperature_host']
+        T_bact = calib.get('temperature_bacterial', T_host)
+        temperature = torch.ones(n_classes)
+        temperature[:n_classes - 1] = T_host
+        temperature[n_classes - 1:] = T_bact
+    else:
+        temperature = calib.get('temperature', 1.0)
 
     logger.info(f"Model loaded: {len(host_names)} classes, "
                 f"patch_nt_len={patch_nt_len}, device={device}")
