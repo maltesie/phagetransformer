@@ -15,6 +15,10 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 
+# Delimiter separating multiple host labels within a single host_labels cell.
+HOST_LABEL_DELIM = '|'
+
+
 def read_fasta_gz(fasta_path: str) -> List[str]:
     seqs = []
     with gzip.open(fasta_path, 'rt') as fh:
@@ -23,36 +27,160 @@ def read_fasta_gz(fasta_path: str) -> List[str]:
     return seqs
 
 
-def load_phage_host_merged(path_to_dataset):
-    train_seqs = read_fasta_gz(os.path.join(path_to_dataset, "train.fna.gz"))
-    test_seqs = read_fasta_gz(os.path.join(path_to_dataset, "test.fna.gz"))
-    df = pd.read_csv(os.path.join(path_to_dataset, "phages_hosts.csv"),
-                     delimiter=',', dtype=str)
-    test_idx = np.array([b == "1" for b in df["in_testset"]])
-    train_idx = ~test_idx
-    genus_index = {x: i for i, x in enumerate(
-        sorted({h for hs in df["host_genus_lineage"] for h in hs.split("|")}))}
-    labels = np.zeros((len(df), len(genus_index)), dtype=np.float32)
-    for i, hosts in enumerate(df["host_genus_lineage"]):
-        for h in hosts.split("|"):
-            labels[i, genus_index[h]] = 1
-    hosts = np.array([g[0] for g in sorted(genus_index.items(), key=lambda x: x[1])])
-    return train_seqs, labels[train_idx], test_seqs, labels[test_idx], hosts
+def read_fasta_gz_dict(fasta_path: str) -> dict:
+    """Read a gzipped FASTA into a ``{record_id: sequence}`` dict.
+
+    ``record_id`` is BioPython's ``rec.id`` — the first whitespace-delimited
+    token of the header line — and is what gets matched against the
+    ``seq_id`` column of the split CSV. Raises on duplicate ids.
+    """
+    seqs = {}
+    with gzip.open(fasta_path, 'rt') as fh:
+        for rec in SeqIO.parse(fh, 'fasta'):
+            if rec.id in seqs:
+                raise ValueError(
+                    f"Duplicate FASTA record id '{rec.id}' in {fasta_path}")
+            seqs[rec.id] = str(rec.seq)
+    return seqs
 
 
-def load_phage_host_test(path_to_dataset, hosts):
-    test_seqs = read_fasta_gz(os.path.join(path_to_dataset, "combined.fna.gz"))
-    df = pd.read_csv(os.path.join(path_to_dataset, "combined_lineage.csv"),
-                     delimiter=',', dtype=str)
-    genus_index = {x: i for i, x in enumerate(hosts)}
-    labels = np.zeros((len(df), len(genus_index)), dtype=np.float32)
-    for i, hs in enumerate(df["host_genus_lineage"]):
-        for h in hs.split("|"):
-            h_trunc = ';'.join(h.split(';')[1:])
-            if h_trunc in genus_index:
-                labels[i, genus_index[h_trunc]] = 1
-    keep = df["dataset"] != "refseq"
-    return [s for i, s in enumerate(test_seqs) if keep[i]], labels[keep]
+def _build_label_matrix(host_label_cells, hosts):
+    """Build an ``(N, num_classes)`` multi-hot float32 label matrix.
+
+    ``host_label_cells`` is an iterable of ``host_labels`` strings, each a
+    ``HOST_LABEL_DELIM``-delimited list of host labels (multi-label).
+    ``hosts`` defines the class vocabulary and column order. Labels not in
+    ``hosts`` are ignored; the set of ignored labels is returned alongside
+    the matrix so the caller can warn.
+    """
+    host_to_idx = {h: i for i, h in enumerate(hosts)}
+    labels = np.zeros((len(host_label_cells), len(hosts)), dtype=np.float32)
+    unseen = set()
+    for i, cell in enumerate(host_label_cells):
+        for h in str(cell).split(HOST_LABEL_DELIM):
+            h = h.strip()
+            if not h:
+                continue
+            idx = host_to_idx.get(h)
+            if idx is None:
+                unseen.add(h)
+            else:
+                labels[i, idx] = 1.0
+    return labels, unseen
+
+
+def _load_split(dataset_dir, split, hosts=None):
+    """Load one split (``<split>.fna.gz`` + ``<split>.csv``).
+
+    The CSV must have a ``seq_id`` column (matching FASTA record ids) and a
+    ``host_labels`` column (``HOST_LABEL_DELIM``-delimited, multi-label). The
+    table is indexed by ``seq_id`` and sorted by that index; sequences are
+    returned in the same sorted order via id lookup, so seqs and label rows
+    are aligned by id rather than by file position. Only seq_ids present in
+    *both* the FASTA and the CSV are kept (intersection), with a warning on
+    any mismatch.
+
+    If ``hosts`` is None the class vocabulary is built from this split's
+    ``host_labels`` (used for train); otherwise the given vocabulary is
+    reused (val / test), and labels absent from it are ignored with a
+    warning.
+
+    Returns ``(seqs, labels, hosts)``.
+    """
+    fasta_path = os.path.join(dataset_dir, f"{split}.fna.gz")
+    csv_path = os.path.join(dataset_dir, f"{split}.csv")
+
+    id_to_seq = read_fasta_gz_dict(fasta_path)
+
+    # dtype=str + keep_default_na=False: seq_ids stay strings (no numeric
+    # coercion / lost zero-padding) and empty host_labels stay '' (not NaN).
+    df = pd.read_csv(csv_path, delimiter=',', dtype=str, keep_default_na=False)
+    for col in ('seq_id', 'host_labels'):
+        if col not in df.columns:
+            raise ValueError(
+                f"{csv_path} must contain a '{col}' column; "
+                f"found columns: {list(df.columns)}")
+
+    df = df.set_index('seq_id')
+
+    # Drop duplicate seq_ids (keep first) so the FASTA lookup stays 1:1.
+    dup = df.index[df.index.duplicated()].unique().tolist()
+    if dup:
+        logger.warning(f"  [{split}] {len(dup)} duplicate seq_id(s) in "
+                       f"{split}.csv; keeping first occurrence.")
+        df = df[~df.index.duplicated(keep='first')]
+
+    # Sort the table by the seq_id index so seqs and rows share one order.
+    df = df.sort_index()
+
+    # Intersect CSV seq_ids with FASTA record ids.
+    csv_ids, fasta_ids = set(df.index), set(id_to_seq)
+    common = csv_ids & fasta_ids
+    only_csv, only_fasta = csv_ids - fasta_ids, fasta_ids - csv_ids
+    if only_csv or only_fasta:
+        logger.warning(
+            f"  [{split}] seq_id mismatch between {split}.csv and "
+            f"{split}.fna.gz: {len(only_csv)} in CSV only, "
+            f"{len(only_fasta)} in FASTA only; keeping {len(common)} "
+            f"common entries (intersection).")
+    if not common:
+        raise ValueError(
+            f"[{split}] no overlapping seq_ids between {split}.csv and "
+            f"{split}.fna.gz")
+
+    # Keep only common ids, preserving the sorted CSV order.
+    df = df[df.index.isin(common)]
+    seqs = [id_to_seq[sid] for sid in df.index]
+
+    if hosts is None:
+        vocab = set()
+        for cell in df['host_labels']:
+            for h in str(cell).split(HOST_LABEL_DELIM):
+                h = h.strip()
+                if h:
+                    vocab.add(h)
+        hosts = np.array(sorted(vocab))
+
+    labels, unseen = _build_label_matrix(df['host_labels'].tolist(), hosts)
+    if unseen:
+        shown = ', '.join(sorted(unseen)[:10])
+        logger.warning(
+            f"  [{split}] {len(unseen)} host label(s) not in the train "
+            f"vocabulary were ignored: {shown}"
+            f"{' …' if len(unseen) > 10 else ''}")
+
+    return seqs, labels, hosts
+
+
+def load_phage_host(dataset_dir):
+    """Load train / val / test splits from a single dataset directory.
+
+    Expects, in ``dataset_dir``::
+
+        train.fna.gz + train.csv
+        val.fna.gz   + val.csv
+        test.fna.gz  + test.csv
+
+    Each CSV has a ``seq_id`` column (matching FASTA record ids) and a
+    ``host_labels`` column (``HOST_LABEL_DELIM``-delimited, multi-label).
+    Tables are sorted by ``seq_id`` and sequences aligned to that order by
+    id. No filtering is applied — the raw split files are taken as complete.
+
+    The class vocabulary (``hosts``) is built from the TRAIN split only;
+    val / test labels are mapped onto it, and any label not seen in train is
+    ignored (with a warning).
+
+    Returns: ``train_seqs, train_labels, val_seqs, val_labels,
+    test_seqs, test_labels, hosts``.
+    """
+    train_seqs, train_labels, hosts = _load_split(dataset_dir, 'train')
+    val_seqs, val_labels, _ = _load_split(dataset_dir, 'val', hosts=hosts)
+    test_seqs, test_labels, _ = _load_split(dataset_dir, 'test', hosts=hosts)
+    logger.info(f"  Loaded splits — train={len(train_seqs)} "
+                f"val={len(val_seqs)} test={len(test_seqs)} "
+                f"classes={len(hosts)}")
+    return (train_seqs, train_labels, val_seqs, val_labels,
+            test_seqs, test_labels, hosts)
 
 
 def _read_fasta_raw(path: str) -> str:

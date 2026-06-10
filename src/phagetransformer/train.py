@@ -30,7 +30,7 @@ from .model import (
     CodonTokenizer,
 )
 from .dataset import (
-    load_phage_host_merged, load_phage_host_test,
+    load_phage_host,
     BacterialGenomeStore, BacterialPatchDataset, BacterialSequenceDataset,
     RandomPatchDataset, EvalPatchDataset, patch_collate_fn,
     PatchSequenceDataset, sequence_collate_fn,
@@ -507,7 +507,6 @@ def main():
     g.add_argument('--run_name', type=str, default='HierDNA')
     g.add_argument('--output_folder', type=str, default='../../../models')
     g.add_argument('--dataset_dir', type=str, default=None)
-    g.add_argument('--testset_dir', type=str, default=None)
     g.add_argument('--host_genome_dir', type=str, default=None,
                    help='Directory with host_genome_manifest.tsv '
                         '(required for bacterial_fragment class in encoder '
@@ -567,12 +566,10 @@ def main():
     # ---- data ------------------------------------------------------------
     here = os.path.dirname(os.path.realpath(__file__))
     ds_path = args.dataset_dir or os.path.join(here, '..', '..', '..', 'datasets', 'PhageTransformer')
-    ts_path = args.testset_dir or os.path.join(here, '..', '..', '..', 'data', 'testsets')
 
     logger.info("Loading data …")
-    train_seqs, train_labels, val_seqs, val_labels, hosts = \
-        load_phage_host_merged(ds_path)
-    test_seqs, test_labels = load_phage_host_test(ts_path, hosts)
+    (train_seqs, train_labels, val_seqs, val_labels,
+     test_seqs, test_labels, hosts) = load_phage_host(ds_path)
     num_classes = len(hosts)
 
     if args.merge_val:
@@ -617,6 +614,15 @@ def main():
         logger.info(f"  Genus mapping: {len(genus_to_idx)} host genera, "
                     f"{n_matched}/{len(genome_store.species_list)} bacterial "
                     f"species have a matching host genus")
+        # Warn about host labels (genera) with no bacterial genome data.
+        available_genera = {sp.split()[0] for sp in genome_store.species_list}
+        missing = sorted(g for g in genus_to_idx if g not in available_genera)
+        if missing:
+            shown = ', '.join(missing[:10])
+            logger.warning(
+                f"  {len(missing)}/{len(genus_to_idx)} host genera have no "
+                f"bacterial genome data: {shown}"
+                f"{' …' if len(missing) > 10 else ''}")
 
     # ---- model config dict (saved with calibration) ----------------------
     model_config = dict(
