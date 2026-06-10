@@ -188,6 +188,8 @@ def predict_sequence(model, tokenizer, seq: str, patch_nt_len: int,
     logits = model(tokens, counts)                  # (1, C)
     if blocked_classes:
         logits[:, blocked_classes] = -1e9
+    if torch.is_tensor(temperature):
+        temperature = temperature.to(logits.device)
     probs = torch.sigmoid(logits / temperature)     # calibrated
     return probs[0].cpu().numpy()
 
@@ -224,6 +226,8 @@ def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
     logits = model(batch_tensor, counts)
     if blocked_classes:
         logits[:, blocked_classes] = -1e9
+    if torch.is_tensor(temperature):
+        temperature = temperature.to(logits.device)
     probs = torch.sigmoid(logits / temperature)
     return probs.cpu().numpy()
 
