@@ -176,7 +176,7 @@ phagetransformer train \
 
 Omit `--host_genome_dir` to train without bacterial genomes. Run `phagetransformer train --help` for the full list of architecture, schedule, and augmentation options.
 
-## Model directory structure
+#### Model directory structure
 
 After training, the model directory contains everything needed for inference:
 
