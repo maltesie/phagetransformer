@@ -19,7 +19,7 @@ python -m venv ptenv && source ptenv/bin/activate
 # Install the package
 pip install git+https://github.com/maltesie/phagetransformer.git
 
-# Update the package
+# Update the package (rerun the init command if new model files got released)
 pip install --upgrade git+https://github.com/maltesie/phagetransformer.git
 ```
 
