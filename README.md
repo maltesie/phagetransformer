@@ -18,6 +18,9 @@ python -m venv ptenv && source ptenv/bin/activate
 
 # Install the package
 pip install git+https://github.com/maltesie/phagetransformer.git
+
+# Update the package
+pip install --upgrade git+https://github.com/maltesie/phagetransformer.git
 ```
 
 ### GPU support
@@ -27,7 +30,7 @@ PhageTransformer uses PyTorch and will automatically use CUDA if available. For 
 ## Quickstart
 
 ```bash
-# Download pre-trained model weights (~100 MB)
+# Download pre-trained model weights (~100 MB), rerun after update
 phagetransformer init
 
 # Or download to a specific directory
