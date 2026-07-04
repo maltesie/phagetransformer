@@ -28,14 +28,20 @@ DEFAULT_MODEL_DIR = os.path.join(
 MODEL_FILES = [
     {
         'filename': 'checkpoints/best_aggregator.pt',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
-        'sha256': '25d0e80ab40a844b8ae7e9f0c526475324fdcc557ed41b5466c441627997e149',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.2.0/best_aggregator.pt',
+        'sha256': 'a645b1e06d8ba9d5b8aa9abe6d49ad7ac61aaf1f8d1e79043d5878e0f8dc6159',
         'size_mb': 80,
     },
     {
+        'filename': 'ood_mahalanobis.npz',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.2.0/ood_mahalanobis.npz',
+        'sha256': 'f3163d72a699c2581338d708d6d937769d756989730986ebefa539bd4a719989',
+        'size_mb': 4,
+    },
+    {
         'filename': 'calibration.json',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/calibration.json',
-        'sha256': 'be425198dbade9ac7e72c809934bdfd586047d406283ffe14ba96ca740602720',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.2.0/calibration.json',
+        'sha256': 'b8f87c939f2982bb658afe24c39cdb0032e39f938952f942f69625bbb386d83a',
         'size_mb': 0.01,
     },
 ]
