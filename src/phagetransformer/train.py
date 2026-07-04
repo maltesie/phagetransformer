@@ -727,9 +727,20 @@ def main():
     # OOD fit loader: training phages only, deterministic eval tiling (full
     # coverage — no subsampling). Host-only labels (width == n_host) so the
     # gatherer treats every row as phage. Used to fit the ID manifold.
-    def build_ood_fit_loader():
+    def build_ood_fit_loader(include_val=False):
+        # Manifold = the model's ID training data. For a production model
+        # (trained on train+val, calibrated via --merge_ood_from) include val
+        # so the manifold isn't fit on a strict subset of what the model saw.
+        # In --merge_val end-of-training, val is already folded into train_seqs
+        # and val_seqs is empty, so this is a no-op there.
+        seqs, labels = train_seqs, train_labels
+        if include_val and len(val_seqs):
+            seqs = list(train_seqs) + list(val_seqs)
+            labels = np.concatenate([train_labels, val_labels], axis=0)
+            logger.info(f"  OOD manifold fit on train+val "
+                        f"({len(train_seqs)}+{len(val_seqs)} sequences).")
         fit_ds = PatchSequenceDataset(
-            train_seqs, train_labels, tokenizer,
+            seqs, labels, tokenizer,
             patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
             is_train=False, stride=args.stride)
         return DataLoader(
@@ -892,7 +903,7 @@ def main():
                              "the dataset dir; none found.")
                 return
             run_ood_only_calibration(
-                model, build_ood_fit_loader(), _disc['loader'], device,
+                model, build_ood_fit_loader(include_val=True), _disc['loader'], device,
                 _unpack_sequence_batch, run_dir, calib_hosts, model_config,
                 args.eval_threshold, n_extra_classes=n_extra_classes,
                 stride=args.stride, merge_ood_from=args.merge_ood_from,
@@ -1280,7 +1291,7 @@ def main():
                                "(OOD-only). Pass a validation calibration.json "
                                "to splice those in.")
             run_ood_only_calibration(
-                model, build_ood_fit_loader(), _disc['loader'], device,
+                model, build_ood_fit_loader(include_val=True), _disc['loader'], device,
                 _unpack_sequence_batch, run_dir, hosts, model_config,
                 args.eval_threshold, n_extra_classes=n_extra_classes,
                 stride=args.stride, merge_ood_from=args.merge_ood_from,
