@@ -13,9 +13,11 @@ gives rare-class sequences denser tiling (more patches per epoch).
 
 import argparse
 import gc
+import gzip
 import json
 import logging
 import os
+import random
 import time
 from typing import Callable, Optional, Tuple
 
@@ -38,7 +40,7 @@ from .dataset import (
 from .utils import (
     compute_metrics, get_cosine_schedule_with_warmup,
     save_checkpoint, load_component, load_best_or_last,
-    CSVLogger, run_calibration,
+    CSVLogger, run_calibration, run_ood_only_calibration,
 )
 
 logger = logging.getLogger(__name__)
@@ -435,10 +437,10 @@ def main():
                    help='Encoder phase: patches per epoch for common-class sequences')
     g.add_argument('--max_patches_per_seq', type=float, default=2.0,
                    help='Encoder phase: patches per epoch for rarest-class sequences')
-    g.add_argument('--eval_stride', type=int, default=2400,
-                   help='Stride for eval tiling (default: patch_nt_len // 2)')
-    g.add_argument('--train_coverage', type=float, default=1.3,
-                   help='Aggregator phase: stride = patch_nt_len / coverage')
+    g.add_argument('--stride', type=int, default=2400,
+                   help='Tiling stride (nt) between patch starts, used '
+                        'identically for aggregator training and for '
+                        'eval/inference. Default patch_nt_len // 2 if unset.')
     g.add_argument('--seq_drop_rate', type=float, default=0.6,
                    help='Aggregator phase train: max fraction of sequence to truncate')
     g.add_argument('--patch_drop_rate', type=float, default=0.1,
@@ -489,9 +491,72 @@ def main():
     g.add_argument('--seed', type=int, default=42)
     g.add_argument('--eval_threshold', type=float, default=0.5)
     g.add_argument('--min_val_precision', type=float, default=0.6,
-                   help='Block classes with val precision below this (0 = disable)')
+                   help='DEPRECATED (no longer drives blocking; kept for CLI '
+                        'compatibility). Class blocking has been replaced by '
+                        'the OOD rejection detector — see --fit_ood.')
     g.add_argument('--min_val_support', type=int, default=1,
-                   help='Min positive val samples to evaluate a class for blocking')
+                   help='DEPRECATED (was: min predictions for block '
+                        'eligibility). Unused now that blocking is replaced '
+                        'by OOD rejection.')
+    g.add_argument('--block_max_fdr', type=float, default=0.5,
+                   help='DEPRECATED (was: block classes whose empirical FDR '
+                        'exceeded this). Unused now that blocking is replaced '
+                        'by OOD rejection.')
+    # -- OOD detector (class-conditional Mahalanobis) ----------------------
+    g.add_argument('--fit_ood', dest='fit_ood', action='store_true',
+                   default=True,
+                   help='Fit the class-conditional Mahalanobis OOD detector at '
+                        'calibration time (replaces class blocking). Default on.')
+    g.add_argument('--no_fit_ood', dest='fit_ood', action='store_false',
+                   help='Disable fitting the OOD detector.')
+    g.add_argument('--ood_target_reject_rate', type=float, default=0.05,
+                   help='Target in-distribution rejection rate used to set the '
+                        'OOD reject threshold on validation phages.')
+    g.add_argument('--ood_shrinkage_lambda', type=float, default=200.0,
+                   help='Hierarchical mean-shrinkage strength (in equivalent '
+                        'patches) pulling rare-genus means toward the family '
+                        'centroid, and families toward the grand mean.')
+    g.add_argument('--ood_score_agg', type=str, default='mean',
+                   choices=['mean', 'max'],
+                   help='Aggregate per-patch Mahalanobis distance into a '
+                        'sequence score via mean (stable) or max (sensitive).')
+    g.add_argument('--ood_tau', type=float, default=0.95,
+                   help='Per-patch typicality threshold (ID-CDF quantile) above '
+                        'which a patch counts toward the OOD-fraction metric.')
+    g.add_argument('--ood_n0', type=float, default=0.0,
+                   help='Patch-count floor constant. 0 (default) disables the '
+                        'floor so short genomes (e.g. microviruses) are not '
+                        'penalised for low patch count; the log1p(n) logistic '
+                        'feature still captures any real count effect. Set >0 '
+                        'to multiply reliability by n/(n+n0).')
+    g.add_argument('--reliability_features', type=str, default='full',
+                   choices=['full', 'ood_count', 'ood_only'],
+                   help="Which features feed the reliability logistic. 'full': "
+                        "OOD + host confidence (top1, margin). 'ood_only': OOD "
+                        "signals alone (no prediction-derived features), so "
+                        "reliability reflects out-of-distribution-ness only. "
+                        "'ood_count': OOD + patch count, no host confidence.")
+    g.add_argument('--ood_normalize', action='store_true',
+                   help='L2-normalize embeddings before fitting and scoring the '
+                        'OOD detectors (whitened distance on the unit sphere / '
+                        'directional). Applied consistently at fit and '
+                        'inference via the stored sidecar. Off by default '
+                        '(magnitude-sensitive Mahalanobis).')
+    g.add_argument('--merge_ood_from', type=str, default=None,
+                   help='Path to a validation-model calibration.json. When set, '
+                        'the OOD/reliability block is fit here (on the discard '
+                        'set) and the logit-space calibration (temperature, FDR '
+                        'thresholds) is spliced in from that file instead of '
+                        'being recomputed. Hard-fails if hosts/model_config/'
+                        'stride differ. Works with --merge_val and '
+                        '--calibrate_only.')
+    g.add_argument('--validation_tani_column', type=str, default=None,
+                   help='Column in val.csv with each phage\'s max tANI to the '
+                        'training set (fraction 0-1). If set, temperature and '
+                        'FDR thresholds are calibrated on the distant subset.')
+    g.add_argument('--tani_cutoff', type=float, default=0.5,
+                   help='Calibrate on val phages with tANI <= this '
+                        '(requires --validation_tani_column)')
 
     # -- runtime ------------------------------------------------------------
     g = parser.add_argument_group('Runtime')
@@ -569,7 +634,8 @@ def main():
 
     logger.info("Loading data …")
     (train_seqs, train_labels, val_seqs, val_labels,
-     test_seqs, test_labels, hosts) = load_phage_host(ds_path)
+     test_seqs, test_labels, hosts, val_tani) = load_phage_host(
+        ds_path, val_tani_col=args.validation_tani_column)
     num_classes = len(hosts)
 
     if args.merge_val:
@@ -577,6 +643,7 @@ def main():
         train_seqs = train_seqs + val_seqs
         train_labels = np.concatenate([train_labels, val_labels], axis=0)
         val_seqs, val_labels = [], np.zeros((0, num_classes), dtype=np.float32)
+        val_tani = None
 
     logger.info(f"  train={len(train_seqs)}  val={len(val_seqs)}  "
                 f"test={len(test_seqs)}  classes={num_classes}")
@@ -657,6 +724,120 @@ def main():
     ldr_kw = dict(num_workers=args.num_workers, pin_memory=True,
                   persistent_workers=args.num_workers > 0)
 
+    # OOD fit loader: training phages only, deterministic eval tiling (full
+    # coverage — no subsampling). Host-only labels (width == n_host) so the
+    # gatherer treats every row as phage. Used to fit the ID manifold.
+    def build_ood_fit_loader():
+        fit_ds = PatchSequenceDataset(
+            train_seqs, train_labels, tokenizer,
+            patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
+            is_train=False, stride=args.stride)
+        return DataLoader(
+            fit_ds, batch_size=args.aggregator_batch_size, shuffle=False,
+            collate_fn=sequence_collate_fn, **ldr_kw)
+
+    def _read_gz_fasta(path):
+        seqs, pid, buf = {}, None, []
+        with gzip.open(path, 'rt') as f:
+            for line in f:
+                if line.startswith('>'):
+                    if pid is not None:
+                        seqs[pid] = ''.join(buf)
+                    pid = line[1:].split()[0]
+                    buf = []
+                else:
+                    buf.append(line.strip())
+            if pid is not None:
+                seqs[pid] = ''.join(buf)
+        return seqs
+
+    def build_discard_calibration(label_width):
+        """Assemble the production-model OOD calibration set from the discard
+        pools in the dataset folder: discard_id + same-family discard_ood form
+        the ID-calibration set (CDF/threshold/logistic); distant discard_ood is
+        the OOD evaluation set. Returns None if the files aren't present.
+
+        Correctness for the logistic is family-level, so each calib row carries
+        the set of TRUE host families; weights are sampling_weight for
+        discard_id and 1.0 for same-family. Labels are zeros (unused: the
+        manifold is fit on the train loader, and correctness uses true_families).
+        """
+        d = ds_path
+        paths = {k: os.path.join(d, v) for k, v in dict(
+            id_csv='discard_id.csv', ood_csv='discard_ood.csv',
+            id_fna='discard_id.fna.gz', ood_fna='discard_ood.fna.gz').items()}
+        if not all(os.path.exists(p) for p in paths.values()):
+            logger.warning("  Discard pools not found in dataset dir; "
+                           "OOD calibration falls back to the val set.")
+            return None
+        import pandas as pd
+        id_meta = pd.read_csv(paths['id_csv'])
+        ood_meta = pd.read_csv(paths['ood_csv'])
+        id_seq = _read_gz_fasta(paths['id_fna'])
+        ood_seq = _read_gz_fasta(paths['ood_fna'])
+
+        def fam_set(field):
+            return {';'.join(str(g).split(';')[:4])
+                    for g in str(field).split('|') if g and g != 'nan'}
+
+        calib_seqs, calib_fams, calib_w = [], [], []
+        for _, r in id_meta.iterrows():
+            s = id_seq.get(r['phage_id'])
+            if s:
+                calib_seqs.append(s)
+                calib_fams.append(fam_set(r['trained_hosts']))
+                calib_w.append(float(r.get('sampling_weight', 1.0)))
+        div = ood_meta['divergence'] if 'divergence' in ood_meta else None
+        sf = ood_meta[div == 'same_family'] if div is not None else ood_meta.iloc[0:0]
+        for _, r in sf.iterrows():
+            s = ood_seq.get(r['phage_id'])
+            if s:
+                calib_seqs.append(s)
+                calib_fams.append(fam_set(r['novel_hosts']))
+                calib_w.append(1.0)
+        dist = ood_meta[div == 'distant'] if div is not None else ood_meta.iloc[0:0]
+        eval_seqs = [ood_seq[r['phage_id']] for _, r in dist.iterrows()
+                     if ood_seq.get(r['phage_id'])]
+
+        if not calib_seqs:
+            logger.warning("  No usable discard_id/same-family sequences; "
+                           "falling back to val set for OOD calibration.")
+            return None
+
+        def _loader(seqs):
+            labels = np.zeros((len(seqs), label_width), dtype=np.float32)
+            ds = PatchSequenceDataset(
+                seqs, labels, tokenizer, patch_nt_len=args.patch_nt_len,
+                max_patches=args.max_patches, is_train=False, stride=args.stride)
+            return DataLoader(ds, batch_size=args.aggregator_batch_size,
+                              shuffle=False, collate_fn=sequence_collate_fn,
+                              **ldr_kw)
+
+        logger.info(f"  OOD calibration set: {len(id_meta)} discard_id + "
+                    f"{len(sf)} same-family = {len(calib_seqs)} ID-calib rows; "
+                    f"{len(eval_seqs)} distant for eval.")
+        return dict(loader=_loader(calib_seqs),
+                    true_families=calib_fams,
+                    weights=np.asarray(calib_w, dtype=float),
+                    eval_loader=_loader(eval_seqs) if eval_seqs else None)
+
+    # Scrambled val phages: synthetic OOD floor for the diagnostic (structure
+    # destroyed, composition preserved). Deterministic given --seed.
+    def build_ood_scramble_loader():
+        rng = random.Random(args.seed)
+        scrambled = []
+        for s in val_seqs:
+            cl = list(s)
+            rng.shuffle(cl)
+            scrambled.append(''.join(cl))
+        sc_ds = PatchSequenceDataset(
+            scrambled, val_labels, tokenizer,
+            patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
+            is_train=False, stride=args.stride)
+        return DataLoader(
+            sc_ds, batch_size=args.aggregator_batch_size, shuffle=False,
+            collate_fn=sequence_collate_fn, **ldr_kw)
+
     # =====================================================================
     # CALIBRATE-ONLY MODE
     # =====================================================================
@@ -682,7 +863,7 @@ def main():
         val_seq_ds = PatchSequenceDataset(
             val_seqs, calib_val_labels, tokenizer,
             patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
-            is_train=False, eval_stride=args.eval_stride,
+            is_train=False, stride=args.stride,
         )
         if use_bacteria:
             phage_lengths = [len(s) for s in train_seqs]
@@ -695,7 +876,7 @@ def main():
                 genus_to_idx=genus_to_idx,
                 patch_nt_len=args.patch_nt_len,
                 max_patches=args.max_patches, is_train=False,
-                eval_stride=args.eval_stride,
+                stride=args.stride,
             )
             combined_val_ds = ConcatDataset([val_seq_ds, bact_val_ds])
         else:
@@ -704,11 +885,48 @@ def main():
             combined_val_ds, batch_size=args.aggregator_batch_size,
             shuffle=False, collate_fn=sequence_collate_fn, **ldr_kw)
 
+        _disc = build_discard_calibration(calib_val_labels.shape[1])
+        if args.merge_ood_from is not None:
+            if _disc is None:
+                logger.error("--merge_ood_from requires the discard pools in "
+                             "the dataset dir; none found.")
+                return
+            run_ood_only_calibration(
+                model, build_ood_fit_loader(), _disc['loader'], device,
+                _unpack_sequence_batch, run_dir, calib_hosts, model_config,
+                args.eval_threshold, n_extra_classes=n_extra_classes,
+                stride=args.stride, merge_ood_from=args.merge_ood_from,
+                ood_calib_true_families=_disc['true_families'],
+                ood_calib_weights=_disc['weights'],
+                ood_eval_loader=_disc['eval_loader'],
+                ood_target_reject_rate=args.ood_target_reject_rate,
+                ood_shrinkage_lambda=args.ood_shrinkage_lambda,
+                ood_score_agg=args.ood_score_agg,
+                scramble_loader=build_ood_scramble_loader(),
+                ood_tau=args.ood_tau, ood_n0=args.ood_n0,
+                ood_normalize=args.ood_normalize)
+            logger.info("Calibration complete (OOD fit + merged logit "
+                        "calibration).")
+            return
         run_calibration(model, val_loader, device, _unpack_sequence_batch,
                         run_dir, calib_hosts, model_config, args.eval_threshold,
                         args.min_val_precision, args.min_val_support,
-                        eval_stride=args.eval_stride,
-                        n_extra_classes=n_extra_classes)
+                        stride=args.stride,
+                        n_extra_classes=n_extra_classes,
+                        tani=val_tani, tani_cutoff=args.tani_cutoff,
+                        block_max_fdr=args.block_max_fdr,
+                        fit_loader=build_ood_fit_loader(), fit_ood=args.fit_ood,
+                        ood_target_reject_rate=args.ood_target_reject_rate,
+                        ood_shrinkage_lambda=args.ood_shrinkage_lambda,
+                        ood_score_agg=args.ood_score_agg,
+                        scramble_loader=build_ood_scramble_loader(),
+                        ood_tau=args.ood_tau, ood_n0=args.ood_n0,
+                        reliability_features=args.reliability_features,
+                        ood_normalize=args.ood_normalize,
+                        ood_calib_loader=(_disc['loader'] if _disc else None),
+                        ood_calib_true_families=(_disc['true_families'] if _disc else None),
+                        ood_calib_weights=(_disc['weights'] if _disc else None),
+                        ood_eval_loader=(_disc['eval_loader'] if _disc else None))
         logger.info("Calibration complete.")
         return
 
@@ -813,7 +1031,7 @@ def main():
     if not args.merge_val:
         val_patch_ds = EvalPatchDataset(
             val_seqs, enc_val_labels, tokenizer,
-            patch_nt_len=args.patch_nt_len, stride=args.eval_stride,
+            patch_nt_len=args.patch_nt_len, stride=args.stride,
         )
         if enc_use_bacteria:
             n_bact_val = max(1, int(len(val_patch_ds)
@@ -901,7 +1119,7 @@ def main():
     train_seq_ds = PatchSequenceDataset(
         train_seqs, agg_train_labels, tokenizer,
         patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
-        is_train=True, coverage=args.train_coverage,
+        is_train=True, stride=args.stride,
         seq_drop_rate=args.seq_drop_rate,
         patch_drop_rate=args.patch_drop_rate,
         scramble_rate=args.seq_scramble_rate,
@@ -916,7 +1134,7 @@ def main():
             genus_to_idx=genus_to_idx,
             patch_nt_len=args.patch_nt_len,
             max_patches=args.max_patches,
-            coverage=args.train_coverage, is_train=True,
+            is_train=True, stride=args.stride,
             scramble_rate=args.seq_scramble_rate,
         )
         combined_train_ds = ConcatDataset([train_seq_ds, bact_train_ds])
@@ -933,7 +1151,7 @@ def main():
         val_seq_ds = PatchSequenceDataset(
             val_seqs, agg_val_labels, tokenizer,
             patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
-            is_train=False, eval_stride=args.eval_stride,
+            is_train=False, stride=args.stride,
         )
         if use_bacteria:
             n_bacteria_val = max(1, int(len(val_seqs)
@@ -945,7 +1163,7 @@ def main():
                 genus_to_idx=genus_to_idx,
                 patch_nt_len=args.patch_nt_len,
                 max_patches=args.max_patches, is_train=False,
-                eval_stride=args.eval_stride,
+                stride=args.stride,
             )
             combined_val_ds = ConcatDataset([val_seq_ds, bact_val_ds])
         else:
@@ -957,7 +1175,7 @@ def main():
     test_seq_ds = PatchSequenceDataset(
         test_seqs, agg_test_labels, tokenizer,
         patch_nt_len=args.patch_nt_len, max_patches=args.max_patches,
-        is_train=False, eval_stride=args.eval_stride,
+        is_train=False, stride=args.stride,
     )
     if use_bacteria and not args.merge_val:
         n_bacteria_test = max(1, int(len(test_seqs)
@@ -969,7 +1187,7 @@ def main():
             genus_to_idx=genus_to_idx,
             patch_nt_len=args.patch_nt_len,
             max_patches=args.max_patches, is_train=False,
-            eval_stride=args.eval_stride,
+            stride=args.stride,
         )
         combined_test_ds = ConcatDataset([test_seq_ds, bact_test_ds])
     else:
@@ -1028,15 +1246,53 @@ def main():
             logger.warning("  No sequence-level checkpoint found, "
                            "calibrating with current weights")
 
+        _disc = build_discard_calibration(agg_val_labels.shape[1])
         run_calibration(model, seq_val_loader, device, _unpack_sequence_batch,
                         run_dir, hosts, model_config, args.eval_threshold,
                         args.min_val_precision, args.min_val_support,
-                        eval_stride=args.eval_stride,
-                        n_extra_classes=n_extra_classes)
+                        stride=args.stride,
+                        n_extra_classes=n_extra_classes,
+                        tani=val_tani, tani_cutoff=args.tani_cutoff,
+                        block_max_fdr=args.block_max_fdr,
+                        fit_loader=build_ood_fit_loader(), fit_ood=args.fit_ood,
+                        ood_target_reject_rate=args.ood_target_reject_rate,
+                        ood_shrinkage_lambda=args.ood_shrinkage_lambda,
+                        ood_score_agg=args.ood_score_agg,
+                        scramble_loader=build_ood_scramble_loader(),
+                        ood_tau=args.ood_tau, ood_n0=args.ood_n0,
+                        reliability_features=args.reliability_features,
+                        ood_normalize=args.ood_normalize,
+                        ood_calib_loader=(_disc['loader'] if _disc else None),
+                        ood_calib_true_families=(_disc['true_families'] if _disc else None),
+                        ood_calib_weights=(_disc['weights'] if _disc else None),
+                        ood_eval_loader=(_disc['eval_loader'] if _disc else None))
     else:
-        logger.info("\n--- Skipping calibration (--merge_val mode) ---")
-        logger.info("  Copy calibration.json from your tuning run into this "
-                    "run directory to use with predict.py")
+        logger.info("\n--- merge_val mode: fitting OOD calibration on discards ---")
+        _disc = build_discard_calibration(agg_train_labels.shape[1])
+        if _disc is None:
+            logger.warning("  No discard pools found; skipping calibration. "
+                           "Copy calibration.json from your validation run "
+                           "into this run directory to use with predict.py")
+        else:
+            if args.merge_ood_from is None:
+                logger.warning("  --merge_ood_from not set: the merged "
+                               "calibration will have no temperature/FDR "
+                               "(OOD-only). Pass a validation calibration.json "
+                               "to splice those in.")
+            run_ood_only_calibration(
+                model, build_ood_fit_loader(), _disc['loader'], device,
+                _unpack_sequence_batch, run_dir, hosts, model_config,
+                args.eval_threshold, n_extra_classes=n_extra_classes,
+                stride=args.stride, merge_ood_from=args.merge_ood_from,
+                ood_calib_true_families=_disc['true_families'],
+                ood_calib_weights=_disc['weights'],
+                ood_eval_loader=_disc['eval_loader'],
+                ood_target_reject_rate=args.ood_target_reject_rate,
+                ood_shrinkage_lambda=args.ood_shrinkage_lambda,
+                ood_score_agg=args.ood_score_agg,
+                scramble_loader=build_ood_scramble_loader(),
+                ood_tau=args.ood_tau, ood_n0=args.ood_n0,
+                ood_normalize=args.ood_normalize)
 
     logger.info(f"\nTraining complete.")
     logger.info(f"Outputs: {os.path.abspath(run_dir)}")

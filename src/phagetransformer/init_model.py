@@ -28,14 +28,14 @@ DEFAULT_MODEL_DIR = os.path.join(
 MODEL_FILES = [
     {
         'filename': 'checkpoints/best_aggregator.pt',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.1/best_aggregator.pt',
-        'sha256': '775df7f4c10448ae27aaec496057f694f29a3af6e5c0d0c2d1237dfd8dd7992f',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/best_aggregator.pt',
+        'sha256': '25d0e80ab40a844b8ae7e9f0c526475324fdcc557ed41b5466c441627997e149',
         'size_mb': 80,
     },
     {
         'filename': 'calibration.json',
-        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.1/calibration.json',
-        'sha256': 'f0b27b62d5e953231ac6bd3e0773f7be314a88ecccc297406dbb52d907d57399',
+        'url': 'https://github.com/maltesie/phagetransformer/releases/download/v0.1.0/calibration.json',
+        'sha256': 'be425198dbade9ac7e72c809934bdfd586047d406283ffe14ba96ca740602720',
         'size_mb': 0.01,
     },
 ]

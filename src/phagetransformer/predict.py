@@ -50,6 +50,7 @@ import torch
 from Bio import SeqIO
 
 from .model import HierarchicalDNAClassifier, CodonTokenizer
+from .utils import ReliabilityScorer
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,71 @@ def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
     return probs.cpu().numpy()
 
 
+@torch.no_grad()
+def predict_sequence_full(model, tokenizer, seq, patch_nt_len, stride,
+                          temperature, device, max_patches, blocked_classes,
+                          scorer, n_host):
+    """Like predict_sequence but also returns the reliability dict (or None).
+
+    Uses a single encode pass (``predict_with_embeddings``) to get both the
+    host logits and the per-patch embeddings the OOD/reliability score needs.
+    """
+    patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
+    tokens, counts = tokenize_patches(patches, tokenizer)
+    tokens = tokens.to(device, non_blocking=True)
+    counts = counts.to(device, non_blocking=True)
+
+    logits, per_seq, pooled = model.predict_with_embeddings(tokens, counts)
+    if blocked_classes:
+        logits[:, blocked_classes] = -1e9
+    T = temperature.to(logits.device) if torch.is_tensor(temperature) else temperature
+    probs = torch.sigmoid(logits / T)[0].cpu().numpy()
+
+    rel = None
+    if scorer is not None:
+        emb = per_seq[0].to('cpu', torch.float32).numpy()
+        agg_emb = pooled[0].to('cpu', torch.float32).numpy()
+        rel = scorer.score(emb, probs[:n_host], agg_emb=agg_emb)
+    return probs, rel
+
+
+@torch.no_grad()
+def predict_batch_full(model, tokenizer, seqs, patch_nt_len, stride,
+                       temperature, device, max_patches, blocked_classes,
+                       scorer, n_host):
+    """Batch variant of predict_sequence_full. Returns (probs (B,C), rels)."""
+    all_patches, all_counts = [], []
+    for seq in seqs:
+        patches, _ = tile_sequence(seq, patch_nt_len, stride, max_patches)
+        toks = [tokenizer.tokenize(p) for p in patches]
+        all_patches.append(toks)
+        all_counts.append(len(toks))
+
+    max_n = max(all_counts)
+    max_cl = max(t.size(1) for toks in all_patches for t in toks)
+    B = len(seqs)
+    batch_tensor = torch.zeros(B, max_n, 6, max_cl, dtype=torch.long)
+    for i, toks in enumerate(all_patches):
+        for j, t in enumerate(toks):
+            batch_tensor[i, j, :, :t.size(1)] = t
+    batch_tensor = batch_tensor.to(device, non_blocking=True)
+    counts = torch.tensor(all_counts, dtype=torch.long, device=device)
+
+    logits, per_seq, pooled = model.predict_with_embeddings(batch_tensor, counts)
+    if blocked_classes:
+        logits[:, blocked_classes] = -1e9
+    T = temperature.to(logits.device) if torch.is_tensor(temperature) else temperature
+    probs = torch.sigmoid(logits / T).cpu().numpy()
+
+    rels = [None] * B
+    if scorer is not None:
+        pooled = pooled.to('cpu', torch.float32).numpy()
+        for i in range(B):
+            emb = per_seq[i].to('cpu', torch.float32).numpy()
+            rels[i] = scorer.score(emb, probs[i, :n_host], agg_emb=pooled[i])
+    return probs, rels
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -239,7 +305,8 @@ def predict_batch(model, tokenizer, seqs: List[str], patch_nt_len: int,
 
 def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
                    threshold: float, bacterial_threshold: float,
-                   top_k: int) -> List[dict]:
+                   top_k: int, reliability: Optional[dict] = None,
+                   seq_length: Optional[int] = None) -> List[dict]:
     """Format predictions for one sequence as list of output rows.
 
     Returns only genus predictions above threshold, sorted by score
@@ -291,7 +358,25 @@ def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
             'bacterial_score': f"{bact_score:.4f}" if bact_score is not None else '',
             'above_host_threshold': 'yes' if score >= threshold else 'no',
             'above_bacterial_threshold': 'yes' if above_bact else 'no',
+            'seq_length': ('' if seq_length is None else str(int(seq_length))),
         }
+        if reliability is not None:
+            row['ood_distance'] = f"{reliability['ood_distance']:.4f}"
+            row['ood_typicality'] = f"{reliability['ood_typicality']:.4f}"
+            row['ood_fraction'] = f"{reliability['ood_fraction']:.4f}"
+            agg_d = reliability.get('ood_agg_distance', float('nan'))
+            row['ood_agg_distance'] = f"{agg_d:.4f}" if agg_d == agg_d else ''
+            agg_t = reliability.get('ood_agg_typicality', float('nan'))
+            row['ood_agg_typicality'] = (f"{agg_t:.4f}"
+                                         if agg_t == agg_t else '')  # nan->''
+            row['reliability'] = f"{reliability['reliability']:.4f}"
+        else:
+            row['ood_distance'] = ''
+            row['ood_typicality'] = ''
+            row['ood_fraction'] = ''
+            row['ood_agg_distance'] = ''
+            row['ood_agg_typicality'] = ''
+            row['reliability'] = ''
         rows.append(row)
     return rows
 
@@ -323,6 +408,16 @@ def main():
     parser.add_argument('--filter_output', action='store_true',
                         help='Only report predictions above the host '
                              'threshold and below the bacterial threshold')
+    parser.add_argument('--min_reliability', type=float, default=None,
+                        help='Gate on the folded reliability score (0-1). '
+                             'Sequences with reliability below this are handled '
+                             'per --reliability_mode. Requires an OOD/'
+                             'reliability block in calibration.json.')
+    parser.add_argument('--reliability_mode', choices=['drop', 'flag'],
+                        default='flag',
+                        help="With --min_reliability: 'drop' removes low-"
+                             "reliability rows from the output; 'flag' keeps "
+                             "them but sets reliability_pass=no (default).")
     parser.add_argument('--top_k', type=int, default=0,
                         help='Max predictions per sequence (0 = all above threshold)')
     parser.add_argument('--max_patches', type=int, default=512,
@@ -345,22 +440,25 @@ def main():
     hosts = calib['hosts']
     blocked_classes = calib.get('blocked_classes', [])
     patch_nt_len = calib['model_config']['patch_nt_len']
-    stride = calib.get('eval_stride') or patch_nt_len // 2
+    stride = calib.get('stride') or calib.get('eval_stride') or patch_nt_len // 2
     top_k = args.top_k
 
     # Build per-class temperature: use split host/bacterial temperatures
     # when available, otherwise fall back to the single scalar.
     n_classes = calib['model_config']['num_classes']
     has_bact = len(hosts) > 0 and hosts[-1] == 'bacterial_fragment'
+    n_host = n_classes - 1 if has_bact else n_classes
     if calib.get('temperature_host') is not None and has_bact:
         T_host = calib['temperature_host']
         T_bact = calib.get('temperature_bacterial', T_host)
-        n_host = n_classes - 1
         temperature = torch.ones(n_classes)
         temperature[:n_host] = T_host
         temperature[n_host:] = T_bact
     else:
         temperature = calib['temperature']
+
+    # OOD / reliability scorer (None when the run has no ood block)
+    scorer = ReliabilityScorer.from_calibration(args.model_dir, calib)
 
     # Resolve threshold: --threshold overrides --fdr
     if args.threshold is not None:
@@ -385,7 +483,19 @@ def main():
         logger.info(f"  --filter_output: only reporting rows above host "
                     f"threshold and below bacterial threshold")
     if blocked_classes:
-        logger.info(f"  {len(blocked_classes)} blocked classes (low val precision)")
+        logger.info(f"  {len(blocked_classes)} blocked classes")
+    if scorer is not None:
+        logger.info("  OOD/reliability scoring enabled (per-sequence "
+                    "reliability + OOD metrics in output)")
+    if args.min_reliability is not None:
+        if scorer is None:
+            logger.error("--min_reliability set but this model has no OOD/"
+                         "reliability block in calibration.json. Re-run "
+                         "calibration with --fit_ood, or drop the flag.")
+            sys.exit(1)
+        logger.info(f"  --min_reliability {args.min_reliability:.3f} "
+                    f"(mode={args.reliability_mode}): sequences below this "
+                    f"are {'dropped' if args.reliability_mode=='drop' else 'kept but marked reliability_pass=no'}")
 
     # ---- read input ------------------------------------------------------
     logger.info(f"Reading {args.input} …")
@@ -395,7 +505,10 @@ def main():
     # ---- prepare output --------------------------------------------------
     fieldnames = ['sequence_id', 'genus', 'lineage', 'score',
                   'bacterial_score', 'above_host_threshold',
-                  'above_bacterial_threshold']
+                  'above_bacterial_threshold', 'seq_length',
+                  'ood_distance', 'ood_typicality', 'ood_fraction',
+                  'ood_agg_distance', 'ood_agg_typicality',
+                  'reliability', 'reliability_pass']
 
     out_fh = open(args.output, 'w', newline='') if args.output else sys.stdout
     writer = csv.DictWriter(out_fh, fieldnames=fieldnames, delimiter='\t')
@@ -405,6 +518,8 @@ def main():
     tokenizer = CodonTokenizer()
     bact_thresh = args.bacterial_threshold
     filter_out = args.filter_output
+    min_rel = args.min_reliability
+    rel_mode = args.reliability_mode
 
     def _write_rows(rows):
         for row in rows:
@@ -413,15 +528,25 @@ def main():
                     continue
                 if row['above_bacterial_threshold'] == 'yes':
                     continue
+            if min_rel is not None:
+                rv = row.get('reliability', '')
+                passes = (rv != '' and float(rv) >= min_rel)
+                if not passes and rel_mode == 'drop':
+                    continue
+                row['reliability_pass'] = 'yes' if passes else 'no'
+            else:
+                row['reliability_pass'] = ''
             writer.writerow(row)
 
     if args.batch_size <= 1:
         for i, rec in enumerate(records):
-            probs = predict_sequence(
+            probs, rel = predict_sequence_full(
                 model, tokenizer, rec['seq'], patch_nt_len, stride,
-                temperature, device, args.max_patches, blocked_classes)
+                temperature, device, args.max_patches, blocked_classes,
+                scorer, n_host)
             rows = format_results(
-                rec['id'], probs, hosts, threshold, bact_thresh, top_k)
+                rec['id'], probs, hosts, threshold, bact_thresh, top_k,
+                reliability=rel, seq_length=len(rec['seq']))
             _write_rows(rows)
 
             if (i + 1) % 100 == 0:
@@ -430,12 +555,14 @@ def main():
         for start in range(0, len(records), args.batch_size):
             batch_recs = records[start:start + args.batch_size]
             seqs = [r['seq'] for r in batch_recs]
-            all_probs = predict_batch(
+            all_probs, all_rel = predict_batch_full(
                 model, tokenizer, seqs, patch_nt_len, stride,
-                temperature, device, args.max_patches, blocked_classes)
-            for rec, probs in zip(batch_recs, all_probs):
+                temperature, device, args.max_patches, blocked_classes,
+                scorer, n_host)
+            for rec, probs, rel in zip(batch_recs, all_probs, all_rel):
                 rows = format_results(
-                    rec['id'], probs, hosts, threshold, bact_thresh, top_k)
+                    rec['id'], probs, hosts, threshold, bact_thresh, top_k,
+                    reliability=rel, seq_length=len(rec['seq']))
                 _write_rows(rows)
 
             done = min(start + args.batch_size, len(records))

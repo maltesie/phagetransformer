@@ -69,7 +69,7 @@ def _build_label_matrix(host_label_cells, hosts):
     return labels, unseen
 
 
-def _load_split(dataset_dir, split, hosts=None):
+def _load_split(dataset_dir, split, hosts=None, tani_col=None):
     """Load one split (``<split>.fna.gz`` + ``<split>.csv``).
 
     The CSV must have a ``seq_id`` column (matching FASTA record ids) and a
@@ -132,6 +132,14 @@ def _load_split(dataset_dir, split, hosts=None):
     df = df[df.index.isin(common)]
     seqs = [id_to_seq[sid] for sid in df.index]
 
+    tani = None
+    if tani_col is not None:
+        if tani_col not in df.columns:
+            raise ValueError(
+                f"{split}.csv must contain the tANI column '{tani_col}'; "
+                f"found columns: {list(df.columns)}")
+        tani = pd.to_numeric(df[tani_col], errors='coerce').to_numpy(dtype=float)
+
     if hosts is None:
         vocab = set()
         for cell in df['host_labels']:
@@ -149,10 +157,10 @@ def _load_split(dataset_dir, split, hosts=None):
             f"vocabulary were ignored: {shown}"
             f"{' …' if len(unseen) > 10 else ''}")
 
-    return seqs, labels, hosts
+    return seqs, labels, hosts, tani
 
 
-def load_phage_host(dataset_dir):
+def load_phage_host(dataset_dir, val_tani_col=None):
     """Load train / val / test splits from a single dataset directory.
 
     Expects, in ``dataset_dir``::
@@ -170,17 +178,22 @@ def load_phage_host(dataset_dir):
     val / test labels are mapped onto it, and any label not seen in train is
     ignored (with a warning).
 
+    If ``val_tani_col`` is given, that column is read from ``val.csv`` and
+    returned as ``val_tani`` (float array aligned to ``val_seqs``, NaN where
+    missing); otherwise ``val_tani`` is ``None``.
+
     Returns: ``train_seqs, train_labels, val_seqs, val_labels,
-    test_seqs, test_labels, hosts``.
+    test_seqs, test_labels, hosts, val_tani``.
     """
-    train_seqs, train_labels, hosts = _load_split(dataset_dir, 'train')
-    val_seqs, val_labels, _ = _load_split(dataset_dir, 'val', hosts=hosts)
-    test_seqs, test_labels, _ = _load_split(dataset_dir, 'test', hosts=hosts)
+    train_seqs, train_labels, hosts, _ = _load_split(dataset_dir, 'train')
+    val_seqs, val_labels, _, val_tani = _load_split(
+        dataset_dir, 'val', hosts=hosts, tani_col=val_tani_col)
+    test_seqs, test_labels, _, _ = _load_split(dataset_dir, 'test', hosts=hosts)
     logger.info(f"  Loaded splits — train={len(train_seqs)} "
                 f"val={len(val_seqs)} test={len(test_seqs)} "
                 f"classes={len(hosts)}")
     return (train_seqs, train_labels, val_seqs, val_labels,
-            test_seqs, test_labels, hosts)
+            test_seqs, test_labels, hosts, val_tani)
 
 
 def _read_fasta_raw(path: str) -> str:
@@ -707,16 +720,18 @@ class PatchSequenceDataset(Dataset):
     """Sequence-level dataset for the aggregator phase.
 
     Training:  Randomly truncates a fraction of the sequence (0 to
-               ``seq_drop_rate``) at a random position, then tiles with
-               stride = patch_nt_len / coverage + random offset.
-               After tiling, randomly drops patches (0 to ``patch_drop_rate``
-               fraction, keeping at least 1).
-    Eval:      Deterministic stride-based tiling on the full sequence.
+               ``seq_drop_rate``) at a random position, then tiles with the
+               shared ``stride`` plus a random per-epoch offset. After tiling,
+               randomly drops patches (0 to ``patch_drop_rate``, keeping >=1).
+    Eval:      Deterministic tiling with the same ``stride``, no offset.
+
+    The same ``stride`` is used for training and eval/inference so the
+    aggregator always pools over the same patch density.
     """
 
     def __init__(self, sequences, labels, tokenizer, patch_nt_len=4096,
-                 max_patches=512, is_train=True, eval_stride=None,
-                 coverage=2.0, seq_drop_rate=0.0, patch_drop_rate=0.0,
+                 max_patches=512, is_train=True, stride=None,
+                 seq_drop_rate=0.0, patch_drop_rate=0.0,
                  scramble_rate=0.1,
                  min_seq_repeats=1.0, max_seq_repeats=3.0):
         self.sequences = sequences
@@ -725,14 +740,13 @@ class PatchSequenceDataset(Dataset):
         self.patch_nt_len = patch_nt_len
         self.max_patches = max_patches
         self.is_train = is_train
-        self.coverage = coverage
         self.seq_drop_rate = seq_drop_rate
         self.patch_drop_rate = patch_drop_rate
         self.scramble_rate = scramble_rate
         self.zero_label = np.zeros(len(labels[0]), dtype=np.float32)
-        
-        self.train_stride = max(1, int(patch_nt_len / coverage))
-        self.eval_stride = eval_stride or patch_nt_len // 2
+
+        # Single grid spacing shared by training and eval/inference.
+        self.stride = stride or patch_nt_len // 2
 
         if is_train:
             self._reps_base, self._reps_extra_prob = \
@@ -804,7 +818,7 @@ class PatchSequenceDataset(Dataset):
                 offset = random.randint(0, max_offset)
                 seq = seq[offset:]
 
-            patches = self._tile(seq, self.train_stride)
+            patches = self._tile(seq, self.stride)
 
             # Randomly drop patches (keep at least 1)
             if self.patch_drop_rate > 0 and len(patches) > 1:
@@ -814,7 +828,7 @@ class PatchSequenceDataset(Dataset):
                     keep = [random.choice(patches)]
                 patches = keep
         else:
-            patches = self._tile(seq, self.eval_stride)
+            patches = self._tile(seq, self.stride)
 
         toks = [self.tokenizer.tokenize(p) for p in patches]
         max_cl = max(t.size(1) for t in toks)
@@ -836,8 +850,8 @@ class BacterialSequenceDataset(Dataset):
     def __init__(self, genome_store, tokenizer, phage_lengths,
                  n_samples, agg_num_classes, genus_to_idx: dict,
                  patch_nt_len=3072,
-                 max_patches=512, coverage=2.0, is_train=True,
-                 eval_stride=None, scramble_rate=0.0):
+                 max_patches=512, is_train=True,
+                 stride=None, scramble_rate=0.0):
         self.genome_store = genome_store
         self.tokenizer = tokenizer
         self.phage_lengths = phage_lengths
@@ -846,8 +860,7 @@ class BacterialSequenceDataset(Dataset):
         self.max_patches = max_patches
         self.is_train = is_train
         self.split = 'train' if is_train else 'val'
-        self.train_stride = max(1, int(patch_nt_len / coverage))
-        self.eval_stride = eval_stride or patch_nt_len // 2
+        self.stride = stride or patch_nt_len // 2
         self.num_classes = agg_num_classes
         self.genus_to_idx = genus_to_idx
         self.bact_idx = agg_num_classes - 1
@@ -895,7 +908,7 @@ class BacterialSequenceDataset(Dataset):
         else:
             label = self._make_label(genus)
 
-        stride = self.train_stride if self.is_train else self.eval_stride
+        stride = self.stride
         patches = self._tile(seq, stride)
 
         toks = [self.tokenizer.tokenize(p) for p in patches]

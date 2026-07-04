@@ -519,7 +519,7 @@ class SequenceAggregator(nn.Module):
             nn.Linear(d_model, num_classes),
         )
 
-    def forward(self, embs, patch_counts):
+    def forward(self, embs, patch_counts, return_embedding=False):
         B, N, D = embs.shape
         device = embs.device
         x = embs
@@ -527,7 +527,10 @@ class SequenceAggregator(nn.Module):
         x = x * (~pad).float().unsqueeze(-1)
         x = self.norm(self.transformer(x, src_key_padding_mask=pad))
         pooled, _ = self.pooler(x, padding_mask=pad)
-        return self.classifier(pooled)
+        logits = self.classifier(pooled)
+        if return_embedding:
+            return logits, pooled          # pooled: (B, d_model)
+        return logits
 
     @torch.no_grad()
     def get_pooling_weights(self, embs, patch_counts):
@@ -628,6 +631,60 @@ class HierarchicalDNAClassifier(nn.Module):
         embs = torch.nn.utils.rnn.pad_sequence(per_seq, batch_first=True)
 
         return self.aggregator(embs, patch_counts)
+
+    @torch.no_grad()
+    def encode_patches(self, patches: torch.Tensor,
+                       patch_counts: torch.Tensor) -> tuple:
+        """Encode patches into per-sequence patch embeddings (no aggregation).
+
+        This returns exactly the per-patch embeddings that ``forward`` feeds
+        into the aggregator — the tensor that is normally consumed and
+        discarded — so the OOD detector can operate on the same
+        representation the classifier uses, with no recomputation.
+
+        Parameters
+        ----------
+        patches      : (B, max_N, 6, codon_L)
+        patch_counts : (B,)
+
+        Returns
+        -------
+        tuple of length B, where entry ``i`` is a ``(n_i, D)`` tensor of the
+        ``n_i = patch_counts[i]`` patch embeddings for sequence ``i`` (on the
+        same device as ``patches``). Inference-only: always runs under
+        ``no_grad`` with the encoder in whatever mode it is already in.
+        """
+        B, maxN, F_, cL = patches.shape
+        device = patches.device
+        D = self.patch_encoder.output_dim
+
+        valid = torch.arange(maxN, device=device).unsqueeze(0) < patch_counts.unsqueeze(1)
+        flat = patches.reshape(B * maxN, F_, cL)
+        valid_patches = flat[valid.reshape(-1)]
+
+        chunk = self.patches_per_forward
+        parts = []
+        for i in range(0, valid_patches.size(0), chunk):
+            parts.append(self.patch_encoder(valid_patches[i:i + chunk]))
+        valid_embs = torch.cat(parts, 0) if parts else torch.zeros(0, D, device=device)
+
+        return torch.split(valid_embs, patch_counts.tolist())
+
+    @torch.no_grad()
+    def predict_with_embeddings(self, patches: torch.Tensor,
+                                patch_counts: torch.Tensor):
+        """Single encode pass -> (logits, per_seq_patch_embeddings, pooled).
+
+        Returns the aggregator logits (B, num_classes), the tuple of
+        per-sequence ``(n_i, D)`` patch embeddings (for the patch-space OOD
+        score), and the aggregator's pooled sequence embedding (B, d_model)
+        (for the aggregator-space OOD score) — all from one encode pass.
+        """
+        per_seq = self.encode_patches(patches, patch_counts)
+        embs = torch.nn.utils.rnn.pad_sequence(per_seq, batch_first=True)
+        logits, pooled = self.aggregator(embs, patch_counts,
+                                         return_embedding=True)
+        return logits, per_seq, pooled
 
     @torch.no_grad()
     def annotate(self, patches: torch.Tensor,
