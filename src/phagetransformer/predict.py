@@ -354,7 +354,7 @@ def format_results(seq_id: str, probs: np.ndarray, hosts: List[str],
             'sequence_id': seq_id,
             'genus': genus,
             'lineage': host,
-            'score': f"{score:.4f}",
+            'host_score': f"{score:.4f}",
             'bacterial_score': f"{bact_score:.4f}" if bact_score is not None else '',
             'above_host_threshold': 'yes' if score >= threshold else 'no',
             'above_bacterial_threshold': 'yes' if above_bact else 'no',
@@ -408,16 +408,12 @@ def main():
     parser.add_argument('--filter_output', action='store_true',
                         help='Only report predictions above the host '
                              'threshold and below the bacterial threshold')
-    parser.add_argument('--min_reliability', type=float, default=None,
-                        help='Gate on the folded reliability score (0-1). '
-                             'Sequences with reliability below this are handled '
-                             'per --reliability_mode. Requires an OOD/'
-                             'reliability block in calibration.json.')
-    parser.add_argument('--reliability_mode', choices=['drop', 'flag'],
-                        default='flag',
-                        help="With --min_reliability: 'drop' removes low-"
-                             "reliability rows from the output; 'flag' keeps "
-                             "them but sets reliability_pass=no (default).")
+    parser.add_argument('--min_reliability', type=float, default=0.7,
+                        help='Reliability threshold (0-1, default 0.7) used to '
+                             'mark above_reliability_threshold in the output. '
+                             'Ignored (with a warning) if the model has no '
+                             'OOD/reliability block. Set to a negative value '
+                             'to disable the marking.')
     parser.add_argument('--top_k', type=int, default=0,
                         help='Max predictions per sequence (0 = all above threshold)')
     parser.add_argument('--max_patches', type=int, default=512,
@@ -487,15 +483,16 @@ def main():
     if scorer is not None:
         logger.info("  OOD/reliability scoring enabled (per-sequence "
                     "reliability + OOD metrics in output)")
-    if args.min_reliability is not None:
-        if scorer is None:
-            logger.error("--min_reliability set but this model has no OOD/"
-                         "reliability block in calibration.json. Re-run "
-                         "calibration with --fit_ood, or drop the flag.")
-            sys.exit(1)
-        logger.info(f"  --min_reliability {args.min_reliability:.3f} "
-                    f"(mode={args.reliability_mode}): sequences below this "
-                    f"are {'dropped' if args.reliability_mode=='drop' else 'kept but marked reliability_pass=no'}")
+    gate_reliability = (args.min_reliability is not None
+                        and args.min_reliability >= 0.0)
+    if gate_reliability and scorer is None:
+        logger.warning(f"--min_reliability {args.min_reliability:.3f} set but "
+                       "this model has no OOD/reliability block; reliability "
+                       "gate disabled (above_reliability_threshold left blank).")
+        gate_reliability = False
+    elif gate_reliability:
+        logger.info(f"  --min_reliability {args.min_reliability:.3f}: marking "
+                    f"above_reliability_threshold on each prediction.")
 
     # ---- read input ------------------------------------------------------
     logger.info(f"Reading {args.input} …")
@@ -503,12 +500,12 @@ def main():
     logger.info(f"  {len(records)} sequences")
 
     # ---- prepare output --------------------------------------------------
-    fieldnames = ['sequence_id', 'genus', 'lineage', 'score',
-                  'bacterial_score', 'above_host_threshold',
-                  'above_bacterial_threshold', 'seq_length',
+    fieldnames = ['sequence_id', 'seq_length', 'genus', 'lineage',
+                  'host_score', 'above_host_threshold',
+                  'reliability', 'above_reliability_threshold',
+                  'bacterial_score', 'above_bacterial_threshold',
                   'ood_distance', 'ood_typicality', 'ood_fraction',
-                  'ood_agg_distance', 'ood_agg_typicality',
-                  'reliability', 'reliability_pass']
+                  'ood_agg_distance', 'ood_agg_typicality']
 
     out_fh = open(args.output, 'w', newline='') if args.output else sys.stdout
     writer = csv.DictWriter(out_fh, fieldnames=fieldnames, delimiter='\t')
@@ -518,8 +515,7 @@ def main():
     tokenizer = CodonTokenizer()
     bact_thresh = args.bacterial_threshold
     filter_out = args.filter_output
-    min_rel = args.min_reliability
-    rel_mode = args.reliability_mode
+    min_rel = args.min_reliability if gate_reliability else None
 
     def _write_rows(rows):
         for row in rows:
@@ -531,11 +527,9 @@ def main():
             if min_rel is not None:
                 rv = row.get('reliability', '')
                 passes = (rv != '' and float(rv) >= min_rel)
-                if not passes and rel_mode == 'drop':
-                    continue
-                row['reliability_pass'] = 'yes' if passes else 'no'
+                row['above_reliability_threshold'] = 'yes' if passes else 'no'
             else:
-                row['reliability_pass'] = ''
+                row['above_reliability_threshold'] = ''
             writer.writerow(row)
 
     if args.batch_size <= 1:
