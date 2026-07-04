@@ -1,6 +1,6 @@
 # PhageTransformer
 
-A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences into trinucleotides across all six reading frames, using a codon-level tokenizer, a feature extraction CNN, cross-frame attention, and a multi-level transformer architecture to produce multi-label predictions for 1064 host genera.
+A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences into trinucleotides across all six reading frames, using a codon-level tokenizer, a feature extraction CNN, cross-frame attention, and a multi-level transformer architecture to produce multi-label predictions for 1084 host genera.
 
 ## Installation
 
@@ -37,7 +37,7 @@ phagetransformer init
 phagetransformer init --model_dir ./models/PT
 
 # Predict hosts for phage genomes
-phagetransformer predict --input phages.fasta --model_dir ./models/PT
+phagetransformer predict --input phages.fasta --model_dir ./models/PT > pred.tsv
 
 # Train a new model
 phagetransformer train --dataset_dir ./data --host_genome_dir ./genomes
@@ -79,12 +79,17 @@ The output TSV contains one row per prediction (a sequence can have multiple hos
 | Column | Description |
 | --- | --- |
 | `sequence_id` | FASTA record ID |
+| `seq_length` | Sequence length in nucleotides |
 | `genus` | Predicted host genus name |
 | `lineage` | Full taxonomic lineage (Phylum;Class;Order;Family;Genus) |
-| `score` | Calibrated prediction score for this genus |
+| `host_score` | Calibrated prediction score for this genus |
+| `above_host_threshold` | `yes` if host_score ≥ host threshold |
+| `reliability` | Reliability of the prediction based on OOD testing |
+| `above_reliability_threshold` | `yes` if reliability ≥ `min_reliability` |
 | `bacterial_score` | Score for the bacterial_fragment class (empty if model was trained without bacterial genomes) |
-| `above_host_threshold` | `yes` if score ≥ host threshold |
 | `above_bacterial_threshold` | `yes` if bacterial_score ≥ bacterial threshold |
+| `ood_distance`, `ood_typicality`, `ood_fraction` | Patch-level out-of-distribution diagnostics |
+| `ood_agg_distance`, `ood_agg_typicality` | Sequence-level (aggregator) out-of-distribution diagnostics |
 
 If no prediction exceeds the threshold for a sequence, the single best prediction is returned with `above_host_threshold=no`.
 
@@ -98,6 +103,7 @@ If no prediction exceeds the threshold for a sequence, the single best predictio
 | `--threshold` | — | Fixed score threshold (overrides --fdr) |
 | `--fdr` | 0.1 | FDR level for threshold from calibration (e.g. `0.1` for 10% FDR, `0.2` for 20%) |
 | `--bacterial_threshold` | 0.5 | Score threshold for the bacterial_fragment class |
+| `--min_reliability` | 0.7 | Reliability threshold used to set `above_reliability_threshold` |
 | `--filter_output` | off | Only report predictions above the host threshold and below the bacterial threshold |
 | `--top_k` | 0 | Max predictions per sequence (0 = all above threshold) |
 | `--batch_size` | 1 | Sequences per batch (1 saves memory) |
@@ -108,15 +114,6 @@ If no prediction exceeds the threshold for a sequence, the single best predictio
 By default, predictions are thresholded at the FDR 10% level from `calibration.json` (`--fdr 0.1`). Use `--fdr 0.2` for a more permissive 20% FDR, or `--threshold 0.3` to set an exact score cutoff (overrides `--fdr`).
 
 The tiling stride used during prediction is read from `calibration.json` (saved during training) to ensure consistency between training evaluation and inference.
-
-#### Filtering
-
-Use `--filter_output` to get a clean list of confident phage-host predictions. This discards sequences that are either below the host threshold or flagged as bacterial:
-
-```bash
-phagetransformer predict --input phages.fasta --model_dir ./models/PT \
-    --filter_output --bacterial_threshold 0.4
-```
 
 ### train
 
@@ -185,7 +182,8 @@ After training, the model directory contains everything needed for inference:
 
 ```
 {output_folder}/{run_name}/
-├── calibration.json       # Temperature, thresholds, eval_stride, model config, host list
+├── calibration.json       # Temperature, thresholds, stride, model config, host list, reliability/OOD block
+├── ood_mahalanobis.npz    # Reliability/OOD detector (present when reliability calibration was fitted)
 ├── checkpoints/
 │   ├── best_encoder.pt
 │   ├── best_aggregator.pt
@@ -196,7 +194,7 @@ After training, the model directory contains everything needed for inference:
     └── bacterial_species.tsv
 ```
 
-The `calibration.json` file stores all parameters needed for reproducible inference: the temperature scaling factor, FDR-calibrated thresholds, the evaluation tiling stride, blocked classes, the host list with full lineage strings, and the model architecture config.
+The `calibration.json` file stores all parameters needed for reproducible inference: the temperature scaling factor, FDR-calibrated thresholds, the tiling stride, the host list with full lineage strings, the model architecture config, and the reliability/OOD calibration (Mahalanobis model lives in `ood_mahalanobis.npz`.
 
 ## Citation
 
